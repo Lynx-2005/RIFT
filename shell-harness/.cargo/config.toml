@@ -3,3 +3,6 @@
 #   sudo apt install mingw-w64
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+# Test the cross-built binary on this machine with:
+#   cargo test --target x86_64-pc-windows-gnu   (wine must be installed)
+runner = "wine"

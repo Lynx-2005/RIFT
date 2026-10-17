@@ -307,20 +307,50 @@ fn dir_id(dir: &Path) -> Option<(u64, u64)> {
     fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()))
 }
 
-#[cfg(not(unix))]
-fn dir_id(_dir: &Path) -> Option<(u64, u64)> {
-    None
+/// Windows identity: volume serial number plus file index — what the file
+/// system uses in place of (device, inode). `MetadataExt` cannot answer this on
+/// stable Rust, so the directory is opened for its handle information.
+#[cfg(windows)]
+fn dir_id(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    unsafe {
+        // No access rights, share everything: this only asks who the directory
+        // is, and it must not block another reader while a snapshot runs.
+        let h = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(h, &mut info);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let index = (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64;
+        Some((info.dwVolumeSerialNumber as u64, index))
+    }
 }
 
-#[cfg(unix)]
-fn meta_id(meta: &fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn meta_id(_meta: &fs::Metadata) -> (u64, u64) {
-    (0, 0)
+/// Is this directory one the walk must not enter?
+fn is_excluded(dir: &Path, exclude: &[(u64, u64)]) -> bool {
+    dir_id(dir).is_some_and(|id| exclude.contains(&id))
 }
 
 /// Put the tree back the way it was before `turn`. `None` when this session
@@ -497,7 +527,7 @@ fn copy_tree(
         let dst = to.join(&name);
         let meta = entry.metadata()?;
         if meta.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) || exclude.contains(&meta_id(&meta)) {
+            if SKIP_DIRS.contains(&name.as_str()) || is_excluded(&src, exclude) {
                 continue;
             }
             copy_tree(&src, &dst, root, exclude, snap, skipped, spend)?;
@@ -557,7 +587,7 @@ where
         let path = entry.path();
         let meta = entry.metadata()?;
         if meta.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) || exclude.contains(&meta_id(&meta)) {
+            if SKIP_DIRS.contains(&name.as_str()) || is_excluded(&path, exclude) {
                 continue;
             }
             walk(root, &path, exclude, f)?;

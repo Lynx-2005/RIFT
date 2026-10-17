@@ -1242,9 +1242,15 @@ mod tests {
 
     #[test]
     fn short_dir_keeps_a_resume_all_row_on_one_line() {
-        assert_eq!(short_dir("/media/atlas1/RIFT"), "atlas1/RIFT");
-        assert_eq!(short_dir("/alpha"), "/alpha");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            short_dir(&format!("{sep}media{sep}atlas1{sep}RIFT")),
+            format!("atlas1{sep}RIFT")
+        );
+        assert_eq!(short_dir(&format!("{sep}alpha")), format!("{sep}alpha"));
         assert_eq!(short_dir(""), "");
+        #[cfg(windows)]
+        assert_eq!(short_dir(r"C:\Users\rift\proj"), r"rift\proj");
     }
 
     #[test]
@@ -1280,10 +1286,41 @@ mod tests {
         assert_eq!(store.provider_state("openrouter").unwrap().api_key, "fresh");
     }
 
+    /// A command that pauses then prints `n`, in the platform shell's syntax.
+    #[cfg(unix)]
+    fn pause_then_echo(n: &str) -> String {
+        format!("sleep 0.4; echo {n}")
+    }
+
+    #[cfg(windows)]
+    fn pause_then_echo(n: &str) -> String {
+        format!("Start-Sleep -Milliseconds 400; Write-Output {n}")
+    }
+
+    /// The real shell this test needs. A bare wine prefix answers `powershell`
+    /// with a stub that runs nothing, so ask it to actually print something.
+    fn shell_available() -> bool {
+        let mut cmd = std::process::Command::new(crate::shell::SHELL);
+        #[cfg(windows)]
+        cmd.args(["-NoProfile", "-Command", "Write-Output rift-shell-ok"]);
+        #[cfg(unix)]
+        cmd.args(["-c", "echo rift-shell-ok"]);
+        cmd.stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("rift-shell-ok")
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
     fn a_batch_shares_the_wait_and_keeps_call_order() {
         use crate::provider::ToolCall;
         use clap::Parser;
+        if !shell_available() {
+            return;
+        }
         let store = crate::store::Store::memory();
         let cli = crate::config::Cli::parse_from(["rift", "--provider", "openai", "--api-key", "k"]);
         let cfg = Config::from_cli(cli, &store, true).unwrap();
@@ -1293,7 +1330,7 @@ mod tests {
             .map(|n| ToolCall {
                 id: (*n).to_string(),
                 name: "shell".to_string(),
-                input: serde_json::json!({"command": format!("sleep 0.4; echo {n}")}),
+                input: serde_json::json!({"command": pause_then_echo(n)}),
             })
             .collect();
 
@@ -1305,9 +1342,11 @@ mod tests {
         for (i, name) in ["a", "b", "c"].iter().enumerate() {
             assert!(out[i].contains(name), "result {i} is not {name}: {:?}", out[i]);
         }
-        // Three 0.4s commands one after another take 1.2s; together, about 0.4.
+        // Three 0.4s commands one after another take 1.2s; together, about
+        // 0.4s, plus a shell startup each on Windows.
+        let ceiling = if cfg!(windows) { 1600 } else { 1100 };
         assert!(
-            took < std::time::Duration::from_millis(1100),
+            took < std::time::Duration::from_millis(ceiling),
             "batch did not overlap: {took:?}"
         );
     }

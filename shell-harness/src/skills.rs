@@ -235,7 +235,8 @@ mod tests {
             let text = load(Path::new("/tmp"), "deploy").unwrap();
             assert!(text.starts_with("# skill: deploy\nRun make deploy."), "{text}");
             assert!(!text.contains("description:"), "{text}");
-            assert!(text.contains("/deploy"), "the directory is named: {text}");
+            let named = format!("{}deploy", std::path::MAIN_SEPARATOR);
+            assert!(text.contains(&named), "the directory is named: {text}");
         });
     }
 
