@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>RIFT · shell-harness - Checkup Report</title>
+	<script src="https://cdn.tailwindcss.com"></script>
+	<style>
+		body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+		.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+		.report-section { border: 1px solid #222226; background: #0a0a0b; position: relative; }
+		.corner-box { position: absolute; width: 20px; height: 20px; border: 1px solid #222226; background: #000; }
+	</style>
+</head>
+<body class="bg-black text-[#fafafa]">
+	<main class="mx-auto w-full max-w-6xl px-5 py-8 md:px-10 md:py-12">
+		<header class="report-section mb-8 p-6 md:p-8">
+			<div class="corner-box left-0 top-0 -translate-x-1/2 -translate-y-1/2"></div>
+			<div class="corner-box right-0 top-0 translate-x-1/2 -translate-y-1/2"></div>
+			<div class="flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
+				<div>
+					<div class="mono mb-2 text-xs tracking-widest text-[#666]">// CHECKUP</div>
+					<h1 class="text-4xl font-bold tracking-tight md:text-6xl">RIFT · shell-harness</h1>
+					<p class="mono mt-3 text-xs text-[#666]">SIX VITALS · POST-FIX READ · 71 TESTS · TMUX + MOCK PROVIDER</p>
+				</div>
+				<div class="mono text-left text-xs text-[#666] md:text-right">
+					<div>COMMANDCODE REPORT</div>
+					<div class="text-[#444]">2026-10-16</div>
+				</div>
+			</div>
+		</header>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="corner-box left-0 top-0 -translate-x-1/2 -translate-y-1/2"></div>
+			<div class="corner-box right-0 top-0 translate-x-1/2 -translate-y-1/2"></div>
+			<div class="grid gap-8 md:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+				<div>
+					<div class="mono mb-2 text-xs tracking-widest text-[#666]">// OVERALL</div>
+					<div class="text-6xl font-bold tracking-tight md:text-7xl">55</div>
+					<div class="mt-1 text-lg text-[#666]">/ 60</div>
+					<div class="mt-4 inline-flex border border-[#fbbf24]/30 bg-[#fbbf24]/10 px-3 py-1 text-sm text-[#fbbf24]">VERDICT: NEEDS CHANGES — 2 MEDIUM</div>
+					<div class="mt-3 inline-flex border border-[#34d399]/30 bg-[#34d399]/10 px-3 py-1 text-sm text-[#34d399]">NO CRITICALS STANDING</div>
+				</div>
+				<div>
+					<div class="mono mb-3 text-xs tracking-widest text-[#666]">// TL;DR</div>
+					<p class="text-sm leading-6 text-[#a0a0a0]">Both previous Criticals are resolved and five vitals read Healthy. The interactive frame adapts at every width tested, down to 25×8, and repaints a resize with no keystroke. What remains is chrome: three status lines and the printed reports are still built for a wide terminal, so they wrap mid-word at narrow widths. Nothing is hidden, nothing blocks.</p>
+					<p class="mt-4 text-sm leading-6 text-[#fbbf24]">One `/design finish` pass closes both items: clamp the chrome lines, reflow the reports below 60 columns.</p>
+				</div>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// VITALS</div>
+			<div class="overflow-x-auto">
+				<table class="w-full min-w-[720px] border-collapse text-sm">
+					<thead>
+						<tr class="border-b border-[#222226] text-left mono text-xs text-[#666]">
+							<th class="py-3 pr-4 font-normal">#</th>
+							<th class="py-3 pr-4 font-normal">VITAL</th>
+							<th class="py-3 pr-4 font-normal">STATUS</th>
+							<th class="py-3 pr-4 font-normal">SCORE</th>
+							<th class="py-3 font-normal">KEY FINDING</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 text-[#555]">1</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Intentionality</td>
+							<td class="py-4 pr-4 text-[#34d399]">HEALTHY</td>
+							<td class="py-4 pr-4 text-[#34d399]">10/10</td>
+							<td class="py-4 text-[#a0a0a0]">Chosen at every level: one color role per code, documented in source; a glyph vocabulary where every mark has a job; a heading ladder; a table renderer that computes its own columns; an arrival line that states the category</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 text-[#555]">2</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Readability</td>
+							<td class="py-4 pr-4 text-[#34d399]">HEALTHY</td>
+							<td class="py-4 pr-4 text-[#34d399]">10/10</td>
+							<td class="py-4 text-[#a0a0a0]">Hierarchy verified in raw SGR: <span class="mono">[32m</span> prompt, <span class="mono">[36m</span> echo, <span class="mono">[2m</span> output and reasoning, <span class="mono">[1m</span> headings and table header, <span class="mono">[4m</span> code, <span class="mono">[7m</span> selection. Tables align at 100 and 40 columns. Residual risk only: DIM is the theme's rendering, not the app's</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 text-[#555]">3</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Usability</td>
+							<td class="py-4 pr-4 text-[#34d399]">HEALTHY</td>
+							<td class="py-4 pr-4 text-[#34d399]">10/10</td>
+							<td class="py-4 text-[#a0a0a0]">Full turn verified at 100×30 and 40×14; Esc cancels once; bare <span class="mono">/model</span> picker verified through pick → submit; failures prefixed, warnings marked. Zero-provider empty state is code-verified but unreachable here (env keys present)</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 text-[#555]">4</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Responsiveness</td>
+							<td class="py-4 pr-4 text-[#fbbf24]">WATCH</td>
+							<td class="py-4 pr-4 text-[#fbbf24]">5/10</td>
+							<td class="py-4 text-[#a0a0a0]">Frame adapts everywhere tested: 25×8 caps the menu with <span class="mono">↓ 5 more</span>, 40×14 stays coherent, resize repaints with no keystroke. Two gaps outside the frame: three chrome lines print at natural length, and printed reports wrap mid-word below ~60 columns</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 text-[#555]">5</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Speed</td>
+							<td class="py-4 pr-4 text-[#34d399]">HEALTHY</td>
+							<td class="py-4 pr-4 text-[#34d399]">10/10</td>
+							<td class="py-4 text-[#a0a0a0]">Idle cost of the 200ms prompt poll measured at 0.00% CPU over 4s (zero ticks). Tokens print on arrival, spinner clears on the first delta, no flicker or shift in any capture. Network latency not measured</td>
+						</tr>
+						<tr>
+							<td class="py-4 pr-4 text-[#555]">6</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Accessibility</td>
+							<td class="py-4 pr-4 text-[#34d399]">HEALTHY</td>
+							<td class="py-4 pr-4 text-[#34d399]">10/10</td>
+							<td class="py-4 text-[#a0a0a0]">No escalation trigger standing. Reachable at every width tested to 25×8; no state carried by hue alone; the keyboard is the only path and it is complete; the single motion is one cell and stops at the first token</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// COGNITIVE LOAD / RISK</div>
+			<div class="grid gap-6 md:grid-cols-2">
+				<div>
+					<div class="mb-3 text-xl font-semibold">Low, and contained</div>
+					<ul class="space-y-3 text-sm text-[#a0a0a0]">
+						<li><span class="mono mr-2 text-[#34d399]">PASS</span>Frame survives 25×8, 40×14, 100×30 and a live resize</li>
+						<li><span class="mono mr-2 text-[#34d399]">PASS</span>Idle CPU 0.00% with the prompt poll running</li>
+						<li><span class="mono mr-2 text-[#34d399]">PASS</span>Every state carries a word or glyph, not just a hue</li>
+						<li><span class="mono mr-2 text-[#fbbf24]">WATCH</span>Chrome lines (notice, banner, warning) are still natural-length</li>
+						<li><span class="mono mr-2 text-[#fbbf24]">WATCH</span>Printed reports lose their columns below ~60 columns</li>
+					</ul>
+				</div>
+				<div>
+					<div class="mono mb-3 text-xs tracking-widest text-[#666]">// NEXT MODE</div>
+					<div class="flex flex-wrap gap-2">
+						<span class="border border-[#333] px-3 py-1 text-sm text-[#a0a0a0]">/design finish</span>
+					</div>
+					<p class="mono mt-6 text-xs leading-5 text-[#666]">Checkup reports only. Fixes run as a separate mode.</p>
+				</div>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// WHAT'S WORKING</div>
+			<div class="grid gap-4 md:grid-cols-3">
+				<article class="border border-[#1f1f24] p-4">
+					<h2 class="mb-2 text-sm font-semibold">The frame is genuinely width-aware</h2>
+					<p class="text-sm leading-6 text-[#a0a0a0]">Menu rows clamp with an ellipsis, the window caps by terminal height, long input scrolls under the cursor, and a resize repaints immediately. Verified down to 25×8 and across a live resize.</p>
+				</article>
+				<article class="border border-[#1f1f24] p-4">
+					<h2 class="mb-2 text-sm font-semibold">One job per color</h2>
+					<p class="text-sm leading-6 text-[#a0a0a0]">Eight codes, eight roles, confirmed in the raw byte stream. Your turn is green and marked <span class="mono">&gt;</span>, the machine's turn is cyan and marked <span class="mono">❯</span>, failures say <span class="mono">error:</span>, warnings say <span class="mono">!</span>.</p>
+				</article>
+				<article class="border border-[#1f1f24] p-4">
+					<h2 class="mb-2 text-sm font-semibold">Verdicts are visible</h2>
+					<p class="text-sm leading-6 text-[#a0a0a0]">The 8+4 output window keeps <span class="mono">[stderr]</span> and <span class="mono">[exit N]</span> on screen, so a long command's outcome no longer scrolls away unread.</p>
+				</article>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// PRESCRIPTIONS</div>
+			<div class="space-y-5">
+				<article class="border border-[#2a2415] bg-[#0d0b06] p-5">
+					<div class="mono mb-2 text-xs text-[#fbbf24]">P1 · MEDIUM · RESPONSIVENESS</div>
+					<h2 class="mb-2 text-lg font-semibold">Clamp the three chrome lines</h2>
+					<p class="mb-4 text-sm leading-6 text-[#a0a0a0]"><span class="mono">src/ui.rs:360</span> (truncation notice), <span class="mono">src/ui.rs:38</span> (banner), <span class="mono">src/ui.rs:407</span> (warning). At 40 columns the notice breaks mid-word — <span class="mono">… sent to mode</span> / <span class="mono">l)</span> — and at 30 the banner splits <span class="mono">openai ·</span> / <span class="mono">mock-1</span>.</p>
+					<div class="border-l border-[#fbbf24] pl-4 text-sm leading-6 text-[#fbbf24]">FIX: clamp these three with the existing helper at <span class="mono">ui.rs:391</span>. Leave prose alone — wrapping preserves meaning there.</div>
+				</article>
+				<article class="border border-[#2a2415] bg-[#0d0b06] p-5">
+					<div class="mono mb-2 text-xs text-[#fbbf24]">P1 · MEDIUM · RESPONSIVENESS</div>
+					<h2 class="mb-2 text-lg font-semibold">Reflow the printed reports</h2>
+					<p class="mb-4 text-sm leading-6 text-[#a0a0a0]"><span class="mono">src/commands.rs:125</span> (<span class="mono">help</span>) and <span class="mono">src/agent.rs:187</span> (<span class="mono">resume_list</span>). At 40 columns <span class="mono">/help</span> wraps mid-word and its aligned columns collapse.</p>
+					<div class="border-l border-[#fbbf24] pl-4 text-sm leading-6 text-[#fbbf24]">FIX: below ~60 columns, put the name on its own line with the description indented; or route <span class="mono">/?</span> to the live menu, which already adapts.</div>
+				</article>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// CONSIDERED BUT REJECTED</div>
+			<div class="overflow-x-auto">
+				<table class="w-full min-w-[720px] border-collapse text-sm">
+					<thead>
+						<tr class="border-b border-[#222226] text-left mono text-xs text-[#666]">
+							<th class="py-3 pr-4 font-normal">LOCATION</th>
+							<th class="py-3 pr-4 font-normal">CANDIDATE</th>
+							<th class="py-3 font-normal">REJECTED BECAUSE</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 mono text-xs text-[#555]">agent.rs:123-128</td>
+							<td class="py-4 pr-4 text-[#fafafa]"><span class="mono">/rewind</span> destroys stored turns with no confirmation</td>
+							<td class="py-4 text-[#a0a0a0]">The count is typed explicitly, so the number is the confirmation; it is the undo path for a bad turn and it reports what it removed</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 mono text-xs text-[#555]">ui.rs:8</td>
+							<td class="py-4 pr-4 text-[#fafafa]">DIM for tool output as a contrast failure</td>
+							<td class="py-4 text-[#a0a0a0]">Single role now, and default weight for output would flatten the transcript's core hierarchy. The actual color belongs to the theme — logged as risk, not defect</td>
+						</tr>
+						<tr class="border-b border-[#1a1a1e]">
+							<td class="py-4 pr-4 mono text-xs text-[#555]">ui.rs:38</td>
+							<td class="py-4 pr-4 text-[#fafafa]">Add cwd to the arrival line</td>
+							<td class="py-4 text-[#a0a0a0]">Vertical space is the scarce resource; <span class="mono">-C</span> is startup-fixed and <span class="mono">/status</span> names it</td>
+						</tr>
+						<tr>
+							<td class="py-4 pr-4 mono text-xs text-[#555]">ui.rs:681</td>
+							<td class="py-4 pr-4 text-[#fafafa]">The 200ms prompt poll costs battery</td>
+							<td class="py-4 text-[#a0a0a0]">Measured 0.00% CPU over 4s; below measurement noise</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// VERIFICATION</div>
+			<div class="grid gap-6 md:grid-cols-2">
+				<div>
+					<div class="mono mb-3 text-xs text-[#34d399]">RAN</div>
+					<ul class="space-y-3 text-sm text-[#a0a0a0]">
+						<li><span class="mono mr-2 text-[#fafafa]">cargo test --offline</span>71 passed, 0 failed</li>
+						<li><span class="mono mr-2 text-[#fafafa]">tmux 3.4</span>100×30 turn · 40×14 turn + scrollback · 25×8 menu · 30-col arrival · 100×30 → 44×12 resize with no keystroke</li>
+						<li><span class="mono mr-2 text-[#fafafa]">capture-pane -e</span>raw SGR read for all eight color roles</li>
+						<li><span class="mono mr-2 text-[#fafafa]">/proc/&lt;pid&gt;/stat</span>idle ticks sampled 4s apart → 0</li>
+					</ul>
+				</div>
+				<div>
+					<div class="mono mb-3 text-xs text-[#ef4444]">NOT VERIFIED</div>
+					<ul class="space-y-3 text-sm text-[#a0a0a0]">
+						<li>Zero-provider empty state — environment keys make the branch unreachable here</li>
+						<li>Real network streaming; terminals other than tmux; light themes (DIM contrast)</li>
+					</ul>
+				</div>
+			</div>
+		</section>
+
+		<section class="report-section mb-8 p-6 md:p-8">
+			<div class="mono mb-6 text-xs tracking-widest text-[#666]">// VERDICT</div>
+			<div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+				<div>
+					<div class="text-2xl font-bold text-[#fbbf24]">Needs changes</div>
+					<p class="mt-2 max-w-2xl text-sm leading-6 text-[#a0a0a0]">Nothing blocks and both previous Criticals are resolved. Two contained Responsiveness findings are outstanding — a <span class="mono">/design finish</span> pass closes them.</p>
+				</div>
+				<div class="mono text-xs text-[#444] md:text-right">
+					<div>CHECKUP REPORTS ONLY</div>
+					<div>FIXES RUN AS A SEPARATE MODE</div>
+				</div>
+			</div>
+		</section>
+
+		<footer class="mono py-8 text-center text-xs tracking-widest text-[#444]">
+			Generated with CommandCode - 2026-10-16
+		</footer>
+	</main>
+</body>
+</html>
