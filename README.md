@@ -4,7 +4,21 @@ A terminal agent harness whose base tool is the shell, plus skills on disk and M
 
 ## Install
 
-Download the archive for your platform from the latest release:
+Linux and macOS:
+
+```
+curl -fsSL https://raw.githubusercontent.com/Lynx-2005/RIFT/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```
+irm https://raw.githubusercontent.com/Lynx-2005/RIFT/main/install.ps1 | iex
+```
+
+Both scripts download the archive for your OS from the latest release and put
+`rift` on PATH (`~/.local/bin` on Unix, `%LOCALAPPDATA%\rift\bin` on Windows).
+Prefer to do it by hand? Take an archive from the releases page:
 
 - Linux x86_64: `rift-x86_64-unknown-linux-gnu.tar.gz` (glibc) or `rift-x86_64-unknown-linux-musl.tar.gz` (static; runs on any distro)
 - Windows x86_64: `rift-x86_64-pc-windows-msvc.zip` — unzip and run `rift.exe` from Windows Terminal or PowerShell
