@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per OS: macOS cannot be cross-built from Linux.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        working-directory: shell-harness
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        working-directory: .
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell-harness
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          name=rift-${{ matrix.target }}
+          case "${{ matrix.target }}" in
+            *windows*)
+              (cd target/${{ matrix.target }}/release && 7z a ../../../$name.zip rift.exe)
+              ;;
+            *)
+              tar -czf $name.tar.gz -C target/${{ matrix.target }}/release rift
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rift-${{ matrix.target }}
+          path: shell-harness/rift-${{ matrix.target }}.*
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: shell-harness/rift-${{ matrix.target }}.*
