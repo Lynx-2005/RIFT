@@ -226,7 +226,16 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                     .lock()
                     .ok()
                     .and_then(|l| *l)
-                    .map(|u| (u.prompt(), crate::provider::context_window(&session.cfg.model)));
+                    .map(|u| {
+                        (
+                            u.prompt(),
+                            crate::provider::context_window_for(
+                                Some(&store),
+                                session.cfg.provider.name(),
+                                &session.cfg.model,
+                            ),
+                        )
+                    });
                 ui::stats_report(ctx);
             }
             Action::Mcp => {
@@ -288,6 +297,13 @@ pub(crate) fn spawn_catalog_refresh() {
 /// thread while the user is typing: every write goes through the row lock,
 /// and a failed fetch is reported rather than silently shrinking the menu.
 pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
+    // Context windows from models.dev land even when no provider list needs a
+    // refresh: the map changes on its own schedule, covers every provider at
+    // once, and costs one keyless request.
+    let dev = client.fetch_model_contexts();
+    if !dev.is_empty() {
+        store.save_contexts("models.dev", &dev);
+    }
     let need: Vec<(String, String, String)> = crate::commands::PROVIDERS
         .iter()
         .filter_map(|name| {
@@ -319,7 +335,14 @@ pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
         for h in handles {
             if let Ok((name, res)) = h.join() {
                 match res {
-                    Ok(ids) => store.save_models(&name, &ids),
+                    Ok(list) => {
+                        store.save_models(&name, &list.ids);
+                        // The provider's own list is the better source when it
+                        // carries context lengths (OpenRouter does): exact ids.
+                        if !list.contexts.is_empty() {
+                            store.save_contexts(&name, &list.contexts);
+                        }
+                    }
                     Err(e) => crate::ui::warn(&format!(
                         "{name}: could not refresh the model list ({e:#}); showing what is cached"
                     )),
@@ -554,7 +577,11 @@ impl Session {
         let Some(percent) = store.get_autocompact() else { return };
         let Some(u) = self.last.lock().ok().and_then(|l| *l) else { return };
         let prompt = u.prompt();
-        let window = crate::provider::context_window(&self.cfg.model);
+        let window = crate::provider::context_window_for(
+            Some(store),
+            self.cfg.provider.name(),
+            &self.cfg.model,
+        );
         if prompt * 100 < window * percent as u64 {
             return;
         }
@@ -589,7 +616,11 @@ impl Session {
                         .and_then(|l| *l)
                         .map(|u| u.prompt())
                         .unwrap_or(0);
-                    let window = crate::provider::context_window(&self.cfg.model);
+                    let window = crate::provider::context_window_for(
+                        Some(store),
+                        self.cfg.provider.name(),
+                        &self.cfg.model,
+                    );
                     let at = if pressure > 0 {
                         format!(
                             ", last request read {} of ~{} tokens ({}%)",

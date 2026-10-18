@@ -2,6 +2,10 @@
 //! loop never cares which vendor is on the other end.
 use crate::config::{Config, Provider};
 use anyhow::{anyhow, bail, Context, Result};
+
+/// The community model catalog (models.dev) that opencode and pi derive their
+/// context windows from: provider-keyless, one JSON blob, ~9000 models.
+const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 use serde_json::{json, Value};
 use crate::stats::Usage;
 use std::thread;
@@ -173,6 +177,13 @@ pub struct Client {
     pub(crate) http: reqwest::blocking::Client,
 }
 
+/// The provider's model ids plus the context lengths it reported for
+/// them (OpenRouter annotates every model; OpenAI annotates none).
+pub struct ModelList {
+    pub ids: Vec<String>,
+    pub contexts: Vec<(String, u64)>,
+}
+
 impl Client {
     pub fn new() -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
@@ -233,7 +244,7 @@ impl Client {
     /// `GET {base}/models` for OpenAI-compatible providers. Best-effort:
     /// callers keep serving the cached list on error, but the error itself is
     /// surfaced so a silent empty menu is never mistaken for the truth.
-    pub fn fetch_models(&self, base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    pub fn fetch_models(&self, base_url: &str, api_key: &str) -> Result<ModelList> {
         let url = format!("{base_url}/models");
         let v: Value = self
             .http
@@ -247,12 +258,27 @@ impl Client {
             .json()
             .context("parsing the model list")?;
         let mut ids = Vec::new();
+        let mut contexts: Vec<(String, u64)> = Vec::new();
         if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
             for item in data {
-                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                    if !id.is_empty() {
-                        ids.push(id.to_string());
-                    }
+                let Some(id) = item.get("id").and_then(|i| i.as_str()) else { continue };
+                if id.is_empty() {
+                    continue;
+                }
+                ids.push(id.to_string());
+                // Context length when the provider tells us (OpenRouter
+                // does): `context_length` directly, or under `top_provider`.
+                let ctx = item
+                    .get("context_length")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        item.get("top_provider")
+                            .and_then(|t| t.get("context_length"))
+                            .and_then(Value::as_u64)
+                    })
+                    .filter(|c| *c > 0);
+                if let Some(ctx) = ctx {
+                    contexts.push((id.to_string(), ctx));
                 }
             }
         }
@@ -261,7 +287,52 @@ impl Client {
         }
         ids.sort();
         ids.dedup();
-        Ok(ids)
+        Ok(ModelList { ids, contexts })
+    }
+
+    /// Context windows for every model known to models.dev, keyed by bare
+    /// model id (the same source opencode uses; no API key). Best-effort:
+    /// callers proceed without it on any error.
+    pub fn fetch_model_contexts(&self) -> Vec<(String, u64)> {
+        self.fetch_model_contexts_from(MODELS_DEV_URL)
+    }
+
+    /// The same, against an explicit URL (tests point it at a local server).
+    pub fn fetch_model_contexts_from(&self, url: &str) -> Vec<(String, u64)> {
+        let Ok(body) = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(15))
+            .send()
+        else {
+            return Vec::new();
+        };
+        let Ok(v) = body.json::<Value>() else { return Vec::new() };
+        let Some(providers) = v.as_object() else { return Vec::new() };
+        let mut out = Vec::new();
+        for p in providers.values() {
+            let Some(models) = p.get("models").and_then(Value::as_object) else { continue };
+            for (id, m) in models {
+                let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(Value::as_u64)
+                else {
+                    continue;
+                };
+                if ctx > 0 {
+                    // The same id is listed by several providers with
+                    // different windows (200k anthropic, 1M on a 1m tier,
+                    // 198k bedrock). Keep the smallest: a window too small
+                    // compacts one request early, one too large loses the
+                    // request - the reason the heuristic below also errs low.
+                    match out.iter_mut().find(|(seen, _)| seen == id) {
+                        Some(entry) if ctx < entry.1 => entry.1 = ctx,
+                        Some(_) => {}
+                        None => out.push((id.clone(), ctx)),
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 }
 
@@ -742,6 +813,19 @@ fn openai_request(
 /// model id. Every guess errs low: compacting a little early costs one
 /// summarization, while guessing a window too wide can overflow the request
 /// and lose the turn.
+/// The model's context window. An exact id learned from a real source (the
+/// provider's own `/models` list, or models.dev) wins; without one the old
+/// substring guess applies, erring low. `provider` selects the store's table;
+/// `None` skips the lookup (tests, one-shot paths before the cache exists).
+pub fn context_window_for(store: Option<&crate::store::Store>, provider: &str, model: &str) -> u64 {
+    if let Some(store) = store {
+        if let Some(ctx) = store.context_of(provider, model) {
+            return ctx;
+        }
+    }
+    context_window(model)
+}
+
 pub fn context_window(model: &str) -> u64 {
     let m = model.to_ascii_lowercase();
     // The `1m` suffix is Anthropic's own naming for the wide-window tier.
@@ -1221,3 +1305,99 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// A one-request HTTP server on localhost, so the catalog parsers are
+    /// tested against real wire responses without a network or new deps.
+    fn serve_once(body: &'static str) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn the_provider_model_list_yields_ids_and_annotated_contexts() {
+        let base = serve_once(
+            r#"{"data":[
+                {"id":"anthropic/claude-sonnet-4.5","context_length":1000000},
+                {"id":"openai/gpt-4o","top_provider":{"context_length":128000}},
+                {"id":"no-annotation/model"},
+                {"id":""},
+                {"id":"zero/model","context_length":0}
+            ]}"#,
+        );
+        let client = Client::new().unwrap();
+        let list = client.fetch_models(&base, "k").unwrap();
+        assert_eq!(list.ids, vec!["anthropic/claude-sonnet-4.5", "no-annotation/model", "openai/gpt-4o", "zero/model"]);
+        // Only positive, well-formed annotations land; empty ids never do.
+        assert_eq!(list.contexts, vec![("anthropic/claude-sonnet-4.5".to_string(), 1_000_000), ("openai/gpt-4o".to_string(), 128_000)]);
+    }
+
+    #[test]
+    fn models_dev_yields_bare_ids_with_context_windows() {
+        let base = serve_once(
+            r#"{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":200000,"output":64000}}}},
+                "openrouter":{"models":{"anthropic/claude-sonnet-4.5":{"limit":{"context":1000000}}}},
+                "broken":{"models":{"x":{"limit":{"context":0}}},"nomodels":1}}"#,
+        );
+        let client = Client::new().unwrap();
+        let map = client.fetch_model_contexts_from(&base);
+        assert_eq!(
+            map,
+            vec![
+                ("anthropic/claude-sonnet-4.5".to_string(), 1_000_000),
+                ("claude-sonnet-4-5".to_string(), 200_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_exact_context_beats_the_substring_guess() {
+        let store = crate::store::Store::memory();
+        // The guess alone would say 200_000 for this id.
+        assert_eq!(context_window("claude-sonnet-4-5"), 200_000);
+        store.save_contexts("anthropic", &[("claude-sonnet-4-5".to_string(), 1_000_000)]);
+        assert_eq!(
+            context_window_for(Some(&store), "anthropic", "claude-sonnet-4-5"),
+            1_000_000
+        );
+        // Nothing learned: the guess applies unchanged.
+        assert_eq!(context_window_for(Some(&store), "anthropic", "claude-haiku-4.5"), 200_000);
+        assert_eq!(context_window_for(None, "anthropic", "claude-sonnet-4-5"), 200_000);
+    }
+}
+
+#[cfg(test)]
+mod catalog_live_tests {
+    use super::*;
+
+    /// The real models.dev payload: shape and coverage drift on their side,
+    /// so this only runs on demand (`cargo test -- --ignored`).
+    #[test]
+    #[ignore = "needs the network; run explicitly with --ignored"]
+    fn the_real_models_dev_catalog_parses_and_is_populous() {
+        let client = Client::new().unwrap();
+        let map = client.fetch_model_contexts();
+        assert!(map.len() > 3000, "only {} models parsed", map.len());
+        // The same id is published with several windows (200k first-party,
+        // 198k bedrock, 1M on the 1m tier); the merge keeps the smallest, so
+        // the figure errs low like the heuristic it replaces.
+        let sonnet = map.iter().find(|(id, _)| id == "claude-sonnet-4-5");
+        let c = sonnet.expect("sonnet missing from models.dev").1;
+        assert!(c <= 200_000 && c > 0, "sonnet window {c}");
+    }
+}

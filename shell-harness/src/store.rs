@@ -73,6 +73,9 @@ impl Store {
                key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS models(
                provider TEXT PRIMARY KEY, ids TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS contexts(
+               provider TEXT NOT NULL, model TEXT NOT NULL, context INTEGER NOT NULL,
+               PRIMARY KEY(provider, model));
              CREATE TABLE IF NOT EXISTS sessions(
                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,
                provider TEXT NOT NULL, model TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
@@ -165,6 +168,42 @@ impl Store {
              ON CONFLICT(provider) DO UPDATE SET ids=excluded.ids, fetched_at=excluded.fetched_at",
             params![provider, joined, now_secs() as i64],
         );
+    }
+
+    /// Context windows learned for a provider's models, keyed by model id.
+    pub fn save_contexts(&self, provider: &str, map: &[(String, u64)]) {
+        if map.is_empty() {
+            return;
+        }
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM contexts WHERE provider = ?1",
+            params![provider],
+        ) {
+            eprintln!("warning: could not update context windows ({e})");
+            return;
+        }
+        for (id, ctx) in map {
+            let _ = self.conn.execute(
+                "INSERT OR REPLACE INTO contexts(provider, model, context) VALUES(?1,?2,?3)",
+                params![provider, id, *ctx as i64],
+            );
+        }
+    }
+
+    /// The context window learned for one model, exact id first, then bare id
+    /// (OpenRouter ids carry a `vendor/` prefix models.dev's do not).
+    pub fn context_of(&self, provider: &str, model: &str) -> Option<u64> {
+        let q = |m: &str| -> Option<u64> {
+            self.conn
+                .query_row(
+                    "SELECT context FROM contexts WHERE provider = ?1 AND model = ?2",
+                    params![provider, m],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                .map(|v| v.max(0) as u64)
+        };
+        q(model).or_else(|| model.split_once('/').and_then(|(_, bare)| q(bare)))
     }
 
     pub fn models_fresh(&self, provider: &str) -> bool {
@@ -473,5 +512,29 @@ mod tests {
         // Resync replaces, it does not append.
         s.save_messages(id, &hist[..1]);
         assert_eq!(s.load_messages(id).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_windows_are_learned_and_read_back_with_vendor_prefixes() {
+        let s = Store::memory();
+        // OpenRouter annotates its own ids (`vendor/model`); models.dev keys
+        // bare ids. A lookup by either form must find the same window.
+        s.save_contexts(
+            "openrouter",
+            &[("anthropic/claude-sonnet-4.5".to_string(), 1_000_000)],
+        );
+        assert_eq!(s.context_of("openrouter", "anthropic/claude-sonnet-4.5"), Some(1_000_000));
+        s.save_contexts("models.dev", &[("claude-sonnet-4-5".to_string(), 200_000)]);
+        assert_eq!(s.context_of("models.dev", "claude-sonnet-4-5"), Some(200_000));
+        // Unknown model: None, so the heuristic guess still decides.
+        assert_eq!(s.context_of("models.dev", "who-knows"), None);
+        // An empty map must not wipe what is stored.
+        s.save_contexts("openrouter", &[]);
+        assert_eq!(s.context_of("openrouter", "anthropic/claude-sonnet-4.5"), Some(1_000_000));
     }
 }
