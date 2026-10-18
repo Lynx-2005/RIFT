@@ -170,19 +170,34 @@ impl Line {
 /// this returns what was measured and nothing about how it looks. The sections
 /// are ordered so the model's own cost comes first and this process's resource
 /// use second: that is the order the two are usually wondered about.
-pub fn lines() -> Vec<(&'static str, Vec<Line>)> {
-    sections_of(&view())
+/// `(used prompt tokens, context window)` as of the last request, when there
+/// has been one.
+pub type ContextFigures = Option<(u64, u64)>;
+
+pub fn lines(ctx: ContextFigures) -> Vec<(&'static str, Vec<Line>)> {
+    sections_of(&view(), ctx)
 }
 
 /// The sections for an explicit snapshot. Separate from `lines` so the report
 /// can be asserted against fixed figures rather than the live process.
-fn sections_of(v: &View) -> Vec<(&'static str, Vec<Line>)> {
+fn sections_of(v: &View, ctx: ContextFigures) -> Vec<(&'static str, Vec<Line>)> {
     let mut usage = vec![Line::new("requests", v.requests.to_string(), "")];
     if v.requests == 0 {
         usage.push(Line::new("tokens", "none yet", "no model call made"));
         usage.push(Line::new("speed", "none yet", ""));
         usage.push(Line::new("cache hit", "none yet", ""));
+        usage.push(Line::new("context", "none yet", "no model call made"));
     } else {
+        // How much of the window the last request filled: the same figure
+        // autocompact acts on, so a surprise compaction can be checked here.
+        usage.push(match ctx {
+            Some((used, window)) => Line::new(
+                "context",
+                format!("{} of ~{} ({}%)", num(used), num(window), used * 100 / window.max(1)),
+                "last request, as the model saw it",
+            ),
+            None => Line::new("context", "n/a", "no measurement yet"),
+        });
         usage.push(Line::new(
             "tokens",
             format!("{} in, {} out", num(v.usage.prompt()), num(v.usage.output)),
@@ -220,15 +235,11 @@ fn sections_of(v: &View) -> Vec<(&'static str, Vec<Line>)> {
     vec![("model usage", usage), ("this process", process)]
 }
 
-/// The report as plain text, for `--prompt` runs and for tests that care about
-/// the figures rather than the frame.
-pub fn report() -> String {
-    let sections = lines();
-    report_from(&sections)
-}
-
-/// The plain-text rendering of a prepared section list.
-fn report_from(sections: &[(&'static str, Vec<Line>)]) -> String {
+/// The plain-text rendering of a prepared section list. Labels and notes are
+/// passed through `dim` first, so the UI can colour them while plain-text
+/// callers and tests see bare text; the values are always left unpainted,
+/// because the numbers are the point.
+pub fn render(sections: &[(&'static str, Vec<Line>)], dim: &dyn Fn(&str) -> String) -> String {
     let width = sections
         .iter()
         .flat_map(|(_, rows)| rows.iter())
@@ -236,12 +247,20 @@ fn report_from(sections: &[(&'static str, Vec<Line>)]) -> String {
         .max()
         .unwrap_or(0);
     let mut out = String::new();
-    for (heading, rows) in sections {
-        out.push_str(&format!("{heading}\n"));
+    for (i, (heading, rows)) in sections.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&dim(heading));
+        out.push('\n');
         for r in rows {
             let pad = " ".repeat(width - r.label.chars().count());
-            let note = if r.note.is_empty() { String::new() } else { format!("  {}", r.note) };
-            out.push_str(&format!("  {}{}  {}{}\n", r.label, pad, r.value, note));
+            let mut line = format!("  {}{}  {}", dim(r.label), pad, r.value);
+            if !r.note.is_empty() {
+                line.push_str(&format!("  {}", dim(&r.note)));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
     }
     out.trim_end().to_string()
@@ -252,7 +271,7 @@ pub(crate) fn num(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -375,7 +394,8 @@ mod tests {
 
     /// Fixed figures pushed through the real section builder and renderer.
     fn report_of(v: &View) -> String {
-        report_from(&sections_of(v))
+        let sections = sections_of(v, None);
+        render(&sections, &|s| s.to_string())
     }
 
     fn sample(requests: u64, input: u64, cached: u64, output: u64) -> View {
@@ -425,8 +445,8 @@ mod tests {
         assert!(out.contains("requests"), "{out}");
         assert!(out.contains("none yet"), "{out}");
         // Nothing sampled and nothing sent both say so rather than showing 0:
-        // the three token figures say "none yet", the two process ones "n/a".
-        assert_eq!(out.matches("none yet").count(), 3, "{out}");
+        // the four usage figures say "none yet", the two process ones "n/a".
+        assert_eq!(out.matches("none yet").count(), 4, "{out}");
         assert_eq!(out.matches("n/a").count(), 2, "{out}");
     }
 
@@ -444,17 +464,17 @@ mod tests {
     fn the_labels_line_up_so_the_values_read_as_a_column() {
         // The property that makes the report scannable: every value begins in
         // the same column, whatever the label lengths are.
-        let sections = sections_of(&sample(3, 12000, 9000, 2331));
+        let sections = sections_of(&sample(3, 12000, 9000, 2331), Some((150_000, 200_000)));
         let width = sections
             .iter()
             .flat_map(|(_, rows)| rows.iter())
             .map(|r| r.label.chars().count())
             .max()
             .unwrap();
-        let out = report_from(&sections);
+        let out = render(&sections, &|s| s.to_string());
         let value_col = 2 + width + 2;
         let rows: Vec<&str> = out.lines().filter(|l| l.starts_with("  ")).collect();
-        assert_eq!(rows.len(), 6, "{out}");
+        assert_eq!(rows.len(), 7, "{out}");
         for line in rows {
             let rest = &line[value_col..];
             assert!(!rest.starts_with(' '), "ragged value column in {line:?}");
@@ -462,6 +482,20 @@ mod tests {
             // value column.
             assert!(line[2..value_col].trim().len() < value_col - 2, "{line:?}");
         }
+    }
+
+    #[test]
+    fn the_context_line_states_the_window_and_the_share_used() {
+        // The same two numbers autocompact compares: the share is what a
+        // compaction threshold acts on, so it must be readable at a glance.
+        let sections = sections_of(&sample(3, 12000, 9000, 2331), Some((150_000, 200_000)));
+        let out = render(&sections, &|s| s.to_string());
+        assert!(out.contains("150,000 of ~200,000 (75%)"), "{out}");
+        // Without a measurement the line says so rather than inventing a pair.
+        let none = render(&sections_of(&sample(1, 10, 0, 0), None), &|s| s.to_string());
+        assert!(none.contains("context    n/a"), "{none}");
+        let empty = render(&sections_of(&View { cores: 8, ..View::default() }, None), &|s| s.to_string());
+        assert!(empty.contains("context    none yet"), "{empty}");
     }
 
     #[test]

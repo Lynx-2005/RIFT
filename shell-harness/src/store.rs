@@ -225,21 +225,6 @@ impl Store {
         self.conn.last_insert_rowid()
     }
 
-    /// The newest conversation held in this directory, if any. Empty means the
-    /// caller has nowhere to continue and should start fresh.
-    pub fn latest_session_in(&self, cwd: &str) -> Option<i64> {
-        if cwd.is_empty() {
-            return None;
-        }
-        self.conn
-            .query_row(
-                "SELECT id FROM sessions WHERE cwd = ?1 ORDER BY id DESC LIMIT 1",
-                params![cwd],
-                |r| r.get(0),
-            )
-            .ok()
-    }
-
     /// Sessions newest first. `cwd = Some(dir)` keeps only that directory's:
     /// a bare `/resume` asks about here, `/resume all` passes `None`. A
     /// directory with no history lists nothing rather than borrowing another
@@ -396,19 +381,22 @@ mod tests {
         let s = Store::memory();
         let alpha = s.create_session("anthropic", "m", "", "/work/alpha");
         let beta = s.create_session("anthropic", "m", "", "/work/beta");
-        assert_eq!(s.latest_session_in("/work/alpha"), Some(alpha));
-        assert_eq!(s.latest_session_in("/work/beta"), Some(beta));
-        // A directory nothing has happened in has nothing to continue.
-        assert_eq!(s.latest_session_in("/work/gamma"), None, "borrowed another project's chat");
+        // A directory's list holds its own newest conversation and nothing
+        // from anywhere else.
+        assert_eq!(s.list_sessions(1, Some("/work/alpha"))[0].id, alpha);
+        assert_eq!(s.list_sessions(1, Some("/work/beta"))[0].id, beta);
+        // A directory nothing has happened in lists nothing rather than
+        // borrowing another project's chat.
+        assert!(s.list_sessions(1, Some("/work/gamma")).is_empty());
 
         // A newer conversation in the same directory is the one to continue.
         let again = s.create_session("anthropic", "m", "", "/work/alpha");
-        assert_eq!(s.latest_session_in("/work/alpha"), Some(again));
+        assert_eq!(s.list_sessions(1, Some("/work/alpha"))[0].id, again);
 
         // One-shot runs are unlisted, and cannot shadow what is here.
         s.create_session("anthropic", "m", "", "");
-        assert_eq!(s.latest_session_in("/work/beta"), Some(beta));
-        assert_eq!(s.latest_session_in(""), None);
+        assert_eq!(s.list_sessions(1, Some("/work/beta"))[0].id, beta);
+        let _ = beta;
     }
 
     #[test]
@@ -448,9 +436,11 @@ mod tests {
         .unwrap();
         Store::init(&conn).unwrap();
         let s = Store { conn };
-        assert_eq!(s.latest_session_in("/work/alpha"), None);
+        // Rows from before directories belong to none, so they surface only
+        // under /resume all, never as this directory's conversation.
+        assert!(s.list_sessions(10, Some("/work/alpha")).is_empty());
         let id = s.create_session("openai", "m", "", "/work/alpha");
-        assert_eq!(s.latest_session_in("/work/alpha"), Some(id));
+        assert_eq!(s.list_sessions(1, Some("/work/alpha"))[0].id, id);
         assert_eq!(s.list_sessions(10, None).len(), 2, "the old row went missing");
     }
 

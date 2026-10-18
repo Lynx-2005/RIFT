@@ -231,7 +231,8 @@ impl Client {
     }
 
     /// `GET {base}/models` for OpenAI-compatible providers. Best-effort:
-    /// callers fall back to the cached/static list on error.
+    /// callers keep serving the cached list on error, but the error itself is
+    /// surfaced so a silent empty menu is never mistaken for the truth.
     pub fn fetch_models(&self, base_url: &str, api_key: &str) -> Result<Vec<String>> {
         let url = format!("{base_url}/models");
         let v: Value = self
@@ -240,10 +241,11 @@ impl Client {
             .bearer_auth(api_key)
             .timeout(Duration::from_secs(8))
             .send()
-            .context("fetching model list")?
-            .error_for_status()?
+            .with_context(|| format!("reaching {url}"))?
+            .error_for_status()
+            .with_context(|| format!("{base_url} rejected the model-list request"))?
             .json()
-            .context("parsing model list")?;
+            .context("parsing the model list")?;
         let mut ids = Vec::new();
         if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
             for item in data {

@@ -244,7 +244,7 @@ fn submit(line: &str, typed: &Typed, note: String) {
     let _row = row_lock();
     live_end();
     let mut o = std::io::stdout().lock();
-    let _ = write!(o, "{}{}\n", crate::ui::echo_block(line), note);
+    let _ = writeln!(o, "{}{}", crate::ui::echo_block(line), note);
     let _ = o.flush();
     drop(o);
     live_reprint();

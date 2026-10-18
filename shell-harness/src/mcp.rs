@@ -315,7 +315,7 @@ fn start(name: &str, spec: &Value) -> Result<Backend> {
                     .collect()
             })
             .unwrap_or_default();
-        if url != "" {
+        if !url.is_empty() {
             return HttpServer::connect(url, &headers)
                 .map(Backend::Http)
                 .with_context(|| format!("server {name} ({url})"));

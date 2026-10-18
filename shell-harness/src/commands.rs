@@ -63,29 +63,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 pub const PROVIDERS: &[&str] = &["anthropic", "openai", "tokenharbor", "openrouter"];
 
-/// Curated model ids per provider. Freeform ids still work via `/model <id>`,
-/// so this list stays short and instant (no network in the typing path).
-pub fn models_for(provider: Provider) -> &'static [&'static str] {
-    match provider {
-        Provider::Anthropic => &["claude-sonnet-4-5", "claude-opus-5.5", "claude-haiku-4.5"],
-        Provider::Openai => &["gpt-4.1", "gpt-4o", "o4-mini"],
-        Provider::Tokenharbor => &[
-            "claude-sonnet-4.6",
-            "claude-opus-5.5",
-            "gpt-5.5",
-            "glm-5.3",
-            "kimi-k3",
-            "deepseek-v4-pro",
-            "qwen3.7-max",
-        ],
-        Provider::Openrouter => &[
-            "openai/gpt-4.1",
-            "anthropic/claude-sonnet-4.5",
-            "google/gemini-2.5-pro",
-            "x-ai/grok-4",
-        ],
-    }
-}
+/// Anthropic's model ids. Anthropic has no list API, so this static catalog
+/// is the real menu, not a fallback. Freeform ids still work via
+/// `/model <id>`, and every other provider shows only what its `/models`
+/// endpoint returned.
+const ANTHROPIC_MODELS: &[&str] = &["claude-sonnet-4-5", "claude-opus-5.5", "claude-haiku-4.5"];
 
 /// Models matching `frag` anywhere in the id (case-insensitive search);
 /// empty `frag` lists all. Current model is marked via the description.
@@ -124,12 +106,21 @@ pub fn connected_catalog(store: &crate::store::Store) -> Vec<(String, String)> {
         if key.is_empty() {
             continue;
         }
-        let ids: Vec<String> = match store.cached_models(name) {
-            Some((ids, _)) if !ids.is_empty() => ids,
-            _ => models_for(p).iter().map(|s| s.to_string()).collect(),
-        };
-        for id in ids {
-            out.push((name.to_string(), id));
+        // The live catalog or nothing: a provider whose list has never been
+        // fetched (or whose fetch keeps failing) shows no guesses, so a short
+        // menu is always a fact about the connection, never a fake default.
+        // Anthropic is the exception: it has no list API, so its static
+        // catalog is the real one.
+        if let Some((ids, _)) = store.cached_models(name) {
+            for id in ids {
+                if !id.is_empty() {
+                    out.push((name.to_string(), id));
+                }
+            }
+        } else if *name == "anthropic" {
+            for id in ANTHROPIC_MODELS {
+                out.push((name.to_string(), id.to_string()));
+            }
         }
     }
     out
@@ -531,6 +522,9 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "k-or",
             );
+            // A fetched catalog: a provider shows only models it really has,
+            // so the pick has to come from the cache, not a static list.
+            store.save_models("openrouter", &["openai/gpt-4.1".to_string(), "x-ai/grok-4".to_string()]);
             let mut cfg = test_cfg();
             match handle("/model x-ai/grok-4", &mut cfg, &store) {
                 Action::Changed(m) => assert!(m.contains("switched to openrouter"), "{m}"),
@@ -555,19 +549,15 @@ mod tests {
                 "k-or",
             );
             let catalog = connected_catalog(&store);
-            assert_eq!(catalog.len(), 7); // 3 anthropic + 4 openrouter statics
+            // Anthropic shows its static catalog; openrouter has never fetched
+            // a list here, so it contributes nothing rather than guesses.
+            assert_eq!(catalog.len(), 3, "{catalog:?}");
             let names: Vec<_> =
-                model_candidates(&catalog, "openrouter", "openai/gpt-4.1", "SONNET")
+                model_candidates(&catalog, "anthropic", "claude-sonnet-4-5", "SONNET")
                     .iter()
                     .map(|(n, _)| n.clone())
                     .collect();
-            assert_eq!(
-                names,
-                vec![
-                    "claude-sonnet-4-5".to_string(),
-                    "anthropic/claude-sonnet-4.5".to_string()
-                ]
-            );
+            assert_eq!(names, vec!["claude-sonnet-4-5".to_string()]);
         });
     }
 

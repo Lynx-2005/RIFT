@@ -1088,35 +1088,15 @@ fn clamp_words(s: &str, width: usize) -> String {
 /// weight because they are the point, and the notes are dim because they only
 /// qualify. The heading is dim too, so the numbers stay the brightest thing on
 /// screen without a single hue being spent on structure.
-pub fn stats_report() {
-    row(stats_frame().trim_end());
+pub fn stats_report(ctx: crate::stats::ContextFigures) {
+    row(stats_frame(ctx).trim_end());
 }
 
 /// The report body, built without printing so its layout can be asserted.
-fn stats_frame() -> String {
-    let sections = crate::stats::lines();
-    let width = sections
-        .iter()
-        .flat_map(|(_, rows)| rows.iter())
-        .map(|r| r.label.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (i, (heading, rows)) in sections.iter().enumerate() {
-        if i > 0 {
-            out.push_str("\n");
-        }
-        out.push_str(&format!("{}\n", paint(DIM, heading)));
-        for r in rows {
-            let pad = " ".repeat(width - r.label.chars().count());
-            let mut line = format!("  {}{}  {}", paint(DIM, r.label), pad, r.value);
-            if !r.note.is_empty() {
-                line.push_str(&format!("  {}", paint(DIM, &r.note)));
-            }
-            out.push_str(&format!("{}\n", line));
-        }
-    }
-    out
+/// Layout lives in `stats::render`; this only supplies the dimming.
+fn stats_frame(ctx: crate::stats::ContextFigures) -> String {
+    let sections = crate::stats::lines(ctx);
+    crate::stats::render(&sections, &|s| paint(DIM, s))
 }
 
 /// A report or a state notice: neutral weight, no hue. `/help`, `/status`,
@@ -2912,7 +2892,7 @@ mod tests {
     #[test]
     fn the_stats_frame_is_aligned_and_quietly_coloured() {
         let _on = color_fixed(true);
-        let body = stats_frame();
+        let body = stats_frame(None);
         // A heading per section, and the numbers are the only unstyled text:
         // every label and note is dim, so the values are the brightest thing.
         assert!(body.contains("model usage"), "{body:?}");

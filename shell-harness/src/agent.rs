@@ -44,12 +44,8 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
 
     // Warm the model catalog without blocking the first prompt. The loop
     // rebuilds the menu from the cache on every prompt, so fresh rows appear
-    // as soon as the fetch lands. A separate connection: Store is not shared.
-    std::thread::spawn(|| {
-        let Ok(store) = crate::store::Store::open() else { return };
-        let Ok(client) = Client::new() else { return };
-        refresh_catalogs(&store, &client);
-    });
+    // as soon as the fetch lands.
+    spawn_catalog_refresh();
 
     if let Some(prompt) = cfg.prompt.clone() {
         // One-shot: nothing can be typed mid-turn, so the queues stay empty.
@@ -95,6 +91,9 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
             Action::Changed(msg) => {
                 store.touch_session(session_id, session.cfg.provider.name(), &session.cfg.model);
                 ui::ok(&msg);
+                // A just-configured provider has no cached catalog yet; fetch
+                // it in the background so /model works without a restart.
+                spawn_catalog_refresh();
             }
             Action::Models => {
                 refresh_catalogs(&store, &session.client);
@@ -219,7 +218,17 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                     ui::info(&c);
                 }
             }
-            Action::Stats => ui::stats_report(),
+            Action::Stats => {
+                // The same two numbers autocompact compares, so a compaction
+                // can be checked against what the last request actually used.
+                let ctx = session
+                    .last
+                    .lock()
+                    .ok()
+                    .and_then(|l| *l)
+                    .map(|u| (u.prompt(), crate::provider::context_window(&session.cfg.model)));
+                ui::stats_report(ctx);
+            }
             Action::Mcp => {
                 let m = session.tools.mcp.lock();
                 match m {
@@ -263,9 +272,21 @@ fn persist_session(store: &crate::store::Store, cfg: &Config) {
     store.set_active(cfg.provider.name());
 }
 
+/// Refresh the catalog on a background thread: no network in the typing path.
+/// A separate connection, since Store is not shared between threads. Used at
+/// startup and after a provider change, whose catalog is never cached yet.
+pub(crate) fn spawn_catalog_refresh() {
+    std::thread::spawn(|| {
+        let Ok(store) = crate::store::Store::open() else { return };
+        let Ok(client) = Client::new() else { return };
+        refresh_catalogs(&store, &client);
+    });
+}
+
 /// Refresh stale model catalogs for connected providers (Anthropic has no
-/// list API, so it always uses the static list). Silent: safe to run on a
-/// background thread while the user is typing.
+/// list API, so it always uses the static list). Safe to run on a background
+/// thread while the user is typing: every write goes through the row lock,
+/// and a failed fetch is reported rather than silently shrinking the menu.
 pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
     let need: Vec<(String, String, String)> = crate::commands::PROVIDERS
         .iter()
@@ -296,8 +317,13 @@ pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
             handles.push(s.spawn(|| (name.clone(), client.fetch_models(url, key))));
         }
         for h in handles {
-            if let Ok((name, Ok(ids))) = h.join() {
-                store.save_models(&name, &ids);
+            if let Ok((name, res)) = h.join() {
+                match res {
+                    Ok(ids) => store.save_models(&name, &ids),
+                    Err(e) => crate::ui::warn(&format!(
+                        "{name}: could not refresh the model list ({e:#}); showing what is cached"
+                    )),
+                }
             }
         }
     });
