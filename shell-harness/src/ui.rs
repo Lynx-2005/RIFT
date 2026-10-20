@@ -322,13 +322,38 @@ pub fn echo_block(buf: &str) -> String {
     out
 }
 
+/// Cells a painted string occupies, ignoring the SGR escapes `paint` emits.
+fn visible_len(s: &str) -> usize {
+    let mut n = 0usize;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            for d in it.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        n += 1;
+    }
+    n
+}
+
 /// The prompt mark and a line in the "yours" role. Shared by the idle prompt
 /// and the live line, so a line typed mid-turn looks like any other line.
 /// While a wait is running the animated indicator sits in front of the mark,
 /// which is why the prompt never disappears mid-turn: it becomes the status row.
+///
+/// The row is clamped to the window: it is repainted in place with a carriage
+/// return, so a line wider than the terminal would wrap and every redraw would
+/// start on the wrong row and scroll the screen instead of overwriting it.
 pub fn live_line(buf: &str) -> String {
-    let shown = one_line(buf);
-    match live_status() {
+    let status = live_status();
+    let reserved = status.as_ref().map_or(0, |s| visible_len(s) + 2) + 2;
+    let room = crate::term::cols().saturating_sub(reserved).max(4);
+    let shown = clamp(&one_line(buf), room);
+    match status {
         Some(s) => format!("{s}  {}", echo_line(&shown)),
         None => echo_line(&shown),
     }
@@ -2948,6 +2973,19 @@ mod tests {
         RUNNING.fetch_sub(1, Ordering::Relaxed);
         *WORK.lock().unwrap() = None;
         assert_eq!(live_line("hi"), "❯ hi");
+    }
+
+    #[test]
+    fn a_long_live_line_stays_on_one_row() {
+        let long = "x".repeat(crate::term::cols() + 40);
+        let s = live_line(&long);
+        assert!(
+            visible_len(&s) <= crate::term::cols(),
+            "live row wraps: {} cells in {} columns",
+            visible_len(&s),
+            crate::term::cols()
+        );
+        assert!(s.ends_with("..."), "the cut is marked: {s:?}");
     }
 
     #[test]

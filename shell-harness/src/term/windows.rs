@@ -13,9 +13,9 @@ use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode, SetConsoleOutputCP,
     CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
-    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE,
-    STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_WINDOW_INPUT, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -60,11 +60,20 @@ impl RawGuard {
             if GetConsoleMode(h, &mut mode) == 0 {
                 return Some(RawGuard { old: None });
             }
+            // Mouse and window events are console input records, not keys.
+            // With VT input enabled the console turns them into escape
+            // sequences (`ESC[<35;25;24M` for a mouse move), which the line
+            // editor would otherwise have to parse and discard. Leaving the
+            // flags on also means every mouse move wakes the watcher and
+            // repaints the prompt row. Resize is polled from the screen
+            // buffer, so no window events are needed either.
             let raw = (mode
                 & !(ENABLE_ECHO_INPUT
                     | ENABLE_LINE_INPUT
                     | ENABLE_PROCESSED_INPUT
-                    | ENABLE_QUICK_EDIT_MODE))
+                    | ENABLE_QUICK_EDIT_MODE
+                    | ENABLE_MOUSE_INPUT
+                    | ENABLE_WINDOW_INPUT))
                 | ENABLE_EXTENDED_FLAGS
                 | ENABLE_VIRTUAL_TERMINAL_INPUT;
             SetConsoleMode(h, raw);

@@ -47,6 +47,56 @@ pub fn rows() -> usize {
     size().map_or(24, |(_, rows)| rows).max(4)
 }
 
+/// Where the watcher is inside a VT escape sequence.
+///
+/// A console read can stop anywhere inside a sequence: Windows hands back a
+/// whole mouse report per input record (`ESC[<35;25;24M`), and a small read
+/// buffer splits it. Skipping only the bytes of one read would leave the tail
+/// (`5;24M`) to be treated as typed text, which is how mouse movement used to
+/// type `;25M;24M;...` into the prompt. The state therefore lives across reads.
+#[derive(Clone, Copy, PartialEq)]
+enum Escape {
+    None,
+    /// `ESC` seen, waiting for the byte that says which sequence this is.
+    Start,
+    /// `ESC [` seen: parameter bytes, then one final byte in `0x40..=0x7e`.
+    Csi,
+    /// `ESC O` seen: exactly one final byte follows.
+    Ss3,
+}
+
+impl Escape {
+    /// Advance by one byte. Returns true when the byte is ordinary input.
+    fn feed(&mut self, c: u8) -> bool {
+        match *self {
+            Escape::None if c == 0x1b => {
+                *self = Escape::Start;
+                false
+            }
+            Escape::None => true,
+            Escape::Start => {
+                *self = match c {
+                    b'[' => Escape::Csi,
+                    b'O' => Escape::Ss3,
+                    // Alt-<key>: both bytes belong to the shortcut.
+                    _ => Escape::None,
+                };
+                false
+            }
+            Escape::Csi => {
+                if (0x40..=0x7e).contains(&c) {
+                    *self = Escape::None;
+                }
+                false
+            }
+            Escape::Ss3 => {
+                *self = Escape::None;
+                false
+            }
+        }
+    }
+}
+
 /// Watches stdin while the agent works. Esc / Ctrl-C cancel the turn; typing
 /// edits the live line, Enter queues the line to run when the turn ends. Owns
 /// stdin polling so tool execution just reads the flag instead of racing on
@@ -63,11 +113,14 @@ pub fn input_watcher(
     }
     let mut buf = String::new();
     let mut pending: Vec<u8> = Vec::new();
-    while !done.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+    let mut esc = Escape::None;
+    'watch: while !done.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
         if !poll_in(50) {
             continue;
         }
-        let mut b = [0u8; 8];
+        // Larger than one escape sequence, so a mouse report or an arrow key
+        // normally arrives whole; the state machine handles the rare split.
+        let mut b = [0u8; 64];
         // A resize interrupts the read: nothing was typed, so poll again.
         let n = match read_stdin(&mut b) {
             Ok(n) => n,
@@ -76,21 +129,16 @@ pub fn input_watcher(
         if n == 0 {
             continue;
         }
-        // Raw mode: Ctrl-C arrives as 0x03 (ISIG off).
-        if b[0] == 0x03 {
-            cancel.store(true, Ordering::Relaxed);
-            break;
-        }
-        if b[0] == 0x1b {
-            // Lone Esc cancels; escape sequences (arrows) are ignored.
-            if n == 1 || (b[1] != b'[' && b[1] != b'O') {
-                cancel.store(true, Ordering::Relaxed);
-                break;
-            }
-            continue;
-        }
         for &c in &b[..n] {
+            if !esc.feed(c) {
+                continue;
+            }
             match c {
+                // Raw mode: Ctrl-C arrives as 0x03 (ISIG off).
+                0x03 => {
+                    cancel.store(true, Ordering::Relaxed);
+                    break 'watch;
+                }
                 b'\r' | b'\n' => {
                     let line = buf.trim().to_string();
                     buf.clear();
@@ -123,6 +171,15 @@ pub fn input_watcher(
                 }
                 _ => {}
             }
+        }
+        // The read ended between ESC and the rest of its sequence. A lone Esc
+        // still cancels, so give the tail a moment to arrive before deciding.
+        if esc == Escape::Start {
+            if poll_in(30) {
+                continue;
+            }
+            cancel.store(true, Ordering::Relaxed);
+            break;
         }
     }
     // A turn that ends on a half-typed line keeps it instead of dropping it.
@@ -285,6 +342,49 @@ mod tests {
         assert!(!is_side("/btwq"));
         assert!(!is_side("explain /btw"));
         assert!(!is_side("/status"));
+    }
+
+    /// Feed chunks through one parser, as the watcher does across reads, and
+    /// return the bytes it treats as typed text.
+    fn kept(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut esc = Escape::None;
+        let mut out = Vec::new();
+        for chunk in chunks {
+            for &c in *chunk {
+                if esc.feed(c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_escape_sequence_split_anywhere_leaves_no_text_behind() {
+        // A Windows console can end a read at any byte of a mouse report. Every
+        // split point must still swallow the whole sequence: the tail used to
+        // be typed into the prompt as literal `5;24M`.
+        let report = b"\x1b[<35;25;24M";
+        for cut in 0..=report.len() {
+            assert!(
+                kept(&[&report[..cut], &report[cut..]]).is_empty(),
+                "split at byte {cut} leaked text"
+            );
+        }
+        // Arrows, Home/End and Alt-<key> are sequences too, not text.
+        assert!(kept(&[b"\x1b[A"]).is_empty());
+        assert!(kept(&[b"\x1bOA"]).is_empty());
+        assert!(kept(&[b"\x1bx"]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_bytes_around_a_sequence_survive() {
+        assert_eq!(
+            kept(&[b"hi", b"\x1b[<35;25;24M", b"there\r"]),
+            b"hithere\r"
+        );
+        // A reset after a sequence is what keeps later typing working.
+        assert_eq!(kept(&[b"\x1b[A", b"ok"]), b"ok");
     }
 
     #[test]
