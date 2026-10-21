@@ -36,10 +36,13 @@ or run `/provider` inside rift to pick one.
 ## Providers
 
 `/provider` opens a live picker; `/provider <name>` switches directly and asks
-for a key when the provider needs one. Keys are entered as dots, so the paste
-length is visible without printing the secret. Configure as many providers as
-you like: `/model` lists the models from every configured provider together,
-and picking one switches provider automatically.
+for a key for built-in providers, every time, so an existing key can be
+replaced (Enter saves, Esc keeps the current one). Keys are entered as dots, so
+the paste length is visible without printing the secret. A key saved this way
+is used ahead of the provider's environment variable; the variable is the
+fallback when no key is stored. Configure as many providers as you like:
+`/model` lists the models from every configured provider together, and picking
+one switches provider automatically.
 
 Custom endpoints (Ollama, LM Studio, vLLM, a third-party gateway) are saved like
 built-ins:

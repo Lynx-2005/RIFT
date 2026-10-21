@@ -118,16 +118,15 @@ pub fn known_providers(store: &crate::store::Store) -> Vec<Provider> {
     out
 }
 
-/// The key that would be used for this provider right now: environment first,
-/// then the stored row. `None` means no key is set (which is fine for custom
-/// endpoints and fatal for built-ins).
+/// The key that would be used for this provider right now: a key entered in
+/// the app first, then the provider's environment variable. A key set through
+/// `/provider` is an explicit choice, so it must be able to replace a stale
+/// environment key on the next switch.
 pub fn provider_key(p: &Provider, store: &crate::store::Store) -> Option<String> {
-    p.env_key()
-        .or_else(|| {
-            crate::provider::state(p.name(), store)
-                .map(|s| s.api_key)
-                .filter(|k| !k.is_empty())
-        })
+    crate::provider::state(p.name(), store)
+        .map(|s| s.api_key)
+        .filter(|k| !k.is_empty())
+        .or_else(|| p.env_key())
 }
 
 /// Picker rows for `/provider`: every known provider, with whether it is
@@ -136,7 +135,13 @@ pub fn provider_candidates(store: &crate::store::Store, active: &str) -> Vec<(St
     known_providers(store)
         .into_iter()
         .map(|p| {
-            let keyed = provider_key(&p, store).is_some();
+            // A stored key is one the user chose; an environment key is
+            // ambient. Say which one the picker is showing so a surprising
+            // "key set" can be traced to its source.
+            let stored = crate::provider::state(p.name(), store)
+                .map(|s| s.api_key)
+                .filter(|k| !k.is_empty());
+            let from_env = p.env_key().is_some();
             let from_file = crate::provider::file_provider(p.name()).is_some();
             let mut desc = if from_file {
                 format!("from providers.json, {} API", p.wire().as_str())
@@ -148,8 +153,10 @@ pub fn provider_candidates(store: &crate::store::Store, active: &str) -> Vec<(St
             if p.name() == active {
                 desc = format!("current, {desc}");
             }
-            if keyed {
+            if stored.is_some() {
                 desc.push_str(", key set");
+            } else if from_env {
+                desc.push_str(", key set from env");
             } else if p.is_custom() {
                 desc.push_str(", no key needed");
             } else {
@@ -338,7 +345,19 @@ fn persist(store: &crate::store::Store, cfg: &Config) {
     // copied into the database: writing one would go stale the moment the
     // file changes. The active name is still stored so a restart lands here.
     if !crate::provider::is_file_backed(cfg.provider.name()) {
-        store.save_provider(cfg.provider.name(), &cfg.model, &cfg.base_url, &cfg.api_key);
+        // An environment key stays ambient: copying it into the row would make
+        // it outrank a changed or removed env var on the next run. Only a key
+        // entered in the app (or a CLI flag) is stored.
+        let env_key = cfg.provider.env_key();
+        let key = if !cfg.key_flagged && env_key.as_deref() == Some(cfg.api_key.as_str()) {
+            crate::provider::state(cfg.provider.name(), store)
+                .map(|s| s.api_key)
+                .filter(|k| !k.is_empty())
+                .unwrap_or_default()
+        } else {
+            cfg.api_key.clone()
+        };
+        store.save_provider(cfg.provider.name(), &cfg.model, &cfg.base_url, &key);
     }
     store.set_active(cfg.provider.name());
 }
@@ -466,6 +485,10 @@ fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action 
         Ok(o) => o,
         Err(e) => return Action::Problem(e),
     };
+    // An inline `key=` is the key for this switch. Otherwise a built-in always
+    // asks, even when one is already stored: that is how the old key is
+    // replaced instead of being kept forever.
+    let key_given = opts.key.as_deref().is_some_and(|k| !k.is_empty());
     match cfg.switch_provider(&provider, store) {
         Ok(()) => {
             if let Some(m) = opts.model {
@@ -493,7 +516,7 @@ fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action 
                 if cfg.model.is_empty() { "(not set: /model)" } else { &cfg.model },
                 cfg.base_url
             );
-            if cfg.api_key.is_empty() && provider.requires_key() {
+            if provider.requires_key() && !key_given {
                 return Action::NeedKey { msg, env: provider.key_env() };
             }
             Action::Changed(msg)
@@ -761,19 +784,74 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_with_key_skips_prompt() {
+    fn provider_switch_with_a_key_still_prompts_for_a_replacement() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("OPENROUTER_API_KEY").ok();
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let store = Store::memory();
         let mut cfg = test_cfg();
-        assert!(matches!(handle("/provider openrouter", &mut cfg, &store), Action::Changed(_)));
+        // An existing key does not silently win: the switch asks for a new
+        // one, and Esc leaves the old one in place.
+        assert!(matches!(handle("/provider openrouter", &mut cfg, &store), Action::NeedKey { .. }));
         assert_eq!(cfg.api_key, "test-key");
-        assert_eq!(store.provider_state("openrouter").unwrap().api_key, "test-key");
+        assert_eq!(
+            store.provider_state("openrouter").unwrap().api_key,
+            "",
+            "an environment key must stay ambient, not be frozen into the row"
+        );
+        assert_eq!(
+            provider_key(&Provider::builtin("openrouter").unwrap(), &store).as_deref(),
+            Some("test-key")
+        );
         match saved {
             Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
             None => std::env::remove_var("OPENROUTER_API_KEY"),
         }
+    }
+
+    #[test]
+    fn a_stored_key_beats_the_environment_key() {
+        use clap::Parser;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("OPENROUTER_API_KEY").ok();
+        std::env::set_var("OPENROUTER_API_KEY", "env-key");
+        let store = Store::memory();
+        store.save_provider("openrouter", "openai/gpt-4.1", "https://openrouter.ai/api/v1", "stored-key");
+        let cfg = Config::from_cli(
+            crate::config::Cli::parse_from(["rift", "--provider", "openrouter"]),
+            &store,
+            true,
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key, "stored-key", "the key entered in the app must win");
+        let mut switched = Config::for_test();
+        switched
+            .switch_provider(&Provider::builtin("openrouter").unwrap(), &store)
+            .unwrap();
+        assert_eq!(switched.api_key, "stored-key", "a provider switch must use the stored key");
+        match saved {
+            Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn the_provider_picker_says_where_a_key_came_from() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let desc = |rows: Vec<(String, String)>| {
+                rows.into_iter().find(|(n, _)| n == "openai").unwrap().1
+            };
+            // Nothing configured anywhere.
+            assert!(desc(provider_candidates(&store, "anthropic")).contains("no key"));
+            // An env key is labelled as ambient, not as a saved choice.
+            std::env::set_var("OPENAI_API_KEY", "env-key");
+            assert!(desc(provider_candidates(&store, "anthropic")).contains("from env"));
+            // A stored key wins and is labelled as the stored one.
+            store.save_provider("openai", "gpt-4.1", "https://api.openai.com/v1", "stored-key");
+            let d = desc(provider_candidates(&store, "anthropic"));
+            assert!(d.contains("key set") && !d.contains("from env"), "{d}");
+        });
     }
 
     #[test]

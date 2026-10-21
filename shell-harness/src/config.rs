@@ -442,7 +442,9 @@ impl Config {
 }
 
 impl Config {
-    /// Precedence per field: CLI flag > provider env var > stored DB row > default.
+    /// Precedence per field: CLI flag > stored DB row > provider env var > default.
+    /// A key entered through `/provider` is explicit, so it outranks an ambient
+    /// environment variable; the env var is still the fallback when none is stored.
     /// `provider_explicit` is true when `--provider`/`SH_PROVIDER` was given;
     /// otherwise the last session's provider is restored.
     pub fn from_cli(cli: Cli, store: &crate::store::Store, provider_explicit: bool) -> Result<Self> {
@@ -471,8 +473,13 @@ impl Config {
         // A missing key is not fatal at startup. It is reported when a request is made.
         let api_key = cli
             .api_key
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .map(|s| s.api_key.clone())
+                    .filter(|k| !k.is_empty())
+            })
             .or_else(|| provider.env_key())
-            .or_else(|| saved.as_ref().map(|s| s.api_key.clone()))
             .unwrap_or_default();
         let cwd = match cli.cwd {
             Some(p) => p.canonicalize()?,
@@ -537,8 +544,9 @@ pub fn normalize_url(url: &str) -> String {
 }
 
 impl Config {
-    /// Switches provider, restoring its stored model/URL/key when present
-    /// (env key wins), else that provider's defaults.
+    /// Switches provider, restoring its stored model/URL/key when present,
+    /// else that provider's defaults. A stored key wins over the ambient env
+    /// var so a key replaced in the app is the one used next.
     pub fn switch_provider(
         &mut self,
         provider: &Provider,
@@ -557,9 +565,11 @@ impl Config {
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| provider.default_url().to_string()),
         );
-        self.api_key = provider
-            .env_key()
-            .or_else(|| saved.map(|s| s.api_key))
+        self.api_key = saved
+            .as_ref()
+            .map(|s| s.api_key.clone())
+            .filter(|k| !k.is_empty())
+            .or_else(|| provider.env_key())
             .unwrap_or_default();
         self.thinking = store
             .get_thinking(provider.name())

@@ -333,10 +333,19 @@ fn persist_session(store: &crate::store::Store, cfg: &Config) {
         (Some(s), true) => s.base_url.clone(),
         _ => cfg.base_url.clone(),
     };
-    let key = match (&saved, cfg.key_flagged) {
+    let mut key = match (&saved, cfg.key_flagged) {
         (Some(s), true) => s.api_key.clone(),
         _ => cfg.api_key.clone(),
     };
+    // Keep an environment key out of the row: it should stop applying when the
+    // variable is changed or removed, rather than being frozen here.
+    if !cfg.key_flagged && cfg.provider.env_key().as_deref() == Some(cfg.api_key.as_str()) {
+        key = saved
+            .as_ref()
+            .map(|s| s.api_key.clone())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_default();
+    }
     if !crate::provider::is_file_backed(cfg.provider.name()) {
         store.save_provider(cfg.provider.name(), &model, &url, &key);
     }
