@@ -92,9 +92,6 @@ const OUT: &str = "└";
 const THINK_MARK: &str = "[thinking] ";
 
 thread_local! {
-    /// Set on a thread that is answering a side question: its own output is
-    /// collected instead of printed, so it can be placed in one block later.
-    static CAPTURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     /// Reasoning deltas, held until a line is whole, plus whether the
     /// `[thinking]` marker still has to ride on the next line out.
     static THINK: std::cell::RefCell<(String, bool)> = const { std::cell::RefCell::new((String::new(), false)) };
@@ -102,7 +99,7 @@ thread_local! {
 
 /// Break `s` into rows the terminal will not wrap on its own: a row the app
 /// prints must occupy exactly one app row, or the writers that move the cursor
-/// (the prompt row, a landing side block) count rows the terminal folded
+/// (the prompt row, a landing block) count rows the terminal folded
 /// differently. Breaks land on a space where there is one, so prose still
 /// reads; an answer line that fits is passed through untouched.
 fn display_rows(s: &str) -> Vec<String> {
@@ -149,9 +146,6 @@ fn stream_line(s: &str) {
     }
     let _row = crate::term::row_lock();
     for row in display_rows(s) {
-        if to_capture(&format!("{row}\n")) {
-            continue;
-        }
         crate::term::live_take_row();
         println!("{row}");
     }
@@ -166,9 +160,6 @@ pub fn stream_text(r: &str) {
         return;
     }
     let _row = crate::term::row_lock();
-    if to_capture(&format!("{s}\n")) {
-        return;
-    }
     for row in display_rows(s) {
         crate::term::live_take_row();
         println!("{row}");
@@ -180,9 +171,6 @@ pub fn stream_text(r: &str) {
 pub fn stream_end() {
     think_flush();
     let _row = crate::term::row_lock();
-    if to_capture("\n") {
-        return;
-    }
     crate::term::live_reprint();
 }
 
@@ -244,46 +232,6 @@ fn think_flush() {
     } else {
         paint(DIM, &tail)
     });
-}
-
-/// Collect this thread's output instead of writing it to the terminal.
-pub fn start_capture() {
-    CAPTURE.with(|c| *c.borrow_mut() = Some(String::new()));
-}
-
-/// The collected output and a return to normal printing.
-pub fn take_capture() -> Option<String> {
-    CAPTURE.with(|c| c.borrow_mut().take())
-}
-
-fn capturing() -> bool {
-    CAPTURE.with(|c| c.borrow().is_some())
-}
-
-/// Divert `s` to the capture buffer. True when it went there.
-fn to_capture(s: &str) -> bool {
-    CAPTURE.with(|c| match c.borrow_mut().as_mut() {
-        Some(b) => {
-            b.push_str(s);
-            true
-        }
-        None => false,
-    })
-}
-
-/// A finished side question, as one block: the question, then everything the
-/// answer produced. The row lock keeps the block whole, so it lands between
-/// lines of the turn instead of inside one.
-pub fn print_side(question: &str, body: &str) {
-    let _row = crate::term::row_lock();
-    crate::term::live_take_row();
-    println!("{} {}", paint(DIM, "[btw]"), paint(BOLD, question));
-    print!("{body}");
-    if !body.ends_with('\n') {
-        println!();
-    }
-    println!();
-    crate::term::live_reprint();
 }
 
 /// A submitted line, echoed back under the prompt mark. No working indicator:
@@ -410,18 +358,10 @@ pub fn queued_note() -> String {
     paint(DIM, "  queued, runs when this turn ends")
 }
 
-/// The same, for a side question: it runs now, beside the turn.
-pub fn side_note() -> String {
-    paint(DIM, "  asked, the answer lands when it is ready")
-}
-
 /// Print a full line without eating the prompt row: take the row, print, put
 /// the row back underneath. Every writer that opens a line uses this.
 fn row(s: &str) {
     let _row = crate::term::row_lock();
-    if to_capture(&format!("{s}\n")) {
-        return;
-    }
     crate::term::live_take_row();
     println!("{s}");
     crate::term::live_reprint();
@@ -826,11 +766,10 @@ fn elapsed_suffix(d: std::time::Duration) -> String {
 
 impl Spinner {
     pub fn start(label: &str) -> Self {
-        // A side question collects its output; an indicator would draw on the
-        // foreground turn's row while it works. A test gets the same deal: on a
-        // terminal it would spawn a paint thread that scribbles over the real
-        // output and over the spinner state its neighbours assert on.
-        if capturing() || cfg!(test) || !io::stdout().is_terminal() {
+        // A test gets no indicator: on a terminal it would spawn a paint thread
+        // that scribbles over the real output and over the spinner state its
+        // neighbours assert on.
+        if cfg!(test) || !io::stdout().is_terminal() {
             return Spinner { stop: None, handle: None };
         }
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -875,7 +814,7 @@ impl Spinner {
     /// and only its word changes.
     pub fn relabel(&mut self, label: &str) {
         if self.stop.is_none() {
-            return; // inert: captured output, or not a terminal
+            return; // inert: not a terminal
         }
         let label = clamp(label, crate::term::cols().saturating_sub(10));
         if let Ok(mut w) = WORK.lock() {
@@ -1139,9 +1078,6 @@ pub fn warn(s: &str) {
 pub fn error(s: &str) {
     let _row = crate::term::row_lock();
     let line = paint(RED, &format!("error: {s}"));
-    if to_capture(&format!("{line}\n")) {
-        return;
-    }
     crate::term::live_take_row();
     eprintln!("{line}");
     crate::term::live_reprint();

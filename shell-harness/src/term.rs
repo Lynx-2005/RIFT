@@ -105,7 +105,6 @@ pub fn input_watcher(
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     typed: std::sync::Arc<Typed>,
-    side: std::sync::Arc<Typed>,
 ) {
     use std::sync::atomic::Ordering;
     if !is_tty() {
@@ -143,12 +142,7 @@ pub fn input_watcher(
                     let line = buf.trim().to_string();
                     buf.clear();
                     if !line.is_empty() {
-                        // A side question runs now; anything else waits its turn.
-                        if is_side(&line) {
-                            submit(&line, &side, crate::ui::side_note());
-                        } else {
-                            submit(&line, &typed, crate::ui::queued_note());
-                        }
+                        submit(&line, &typed, crate::ui::queued_note());
                     }
                     live_end();
                 }
@@ -185,11 +179,7 @@ pub fn input_watcher(
     // A turn that ends on a half-typed line keeps it instead of dropping it.
     let tail = buf.trim().to_string();
     if done.load(Ordering::Relaxed) && !tail.is_empty() {
-        if is_side(&tail) {
-            submit(&tail, &side, crate::ui::side_note());
-        } else {
-            submit(&tail, &typed, crate::ui::queued_note());
-        }
+        submit(&tail, &typed, crate::ui::queued_note());
     }
     live_end();
 }
@@ -228,16 +218,11 @@ static LIVE_DRAWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static LIVE_BUF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static ROW: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Whole blocks of output take this, so a side answer never splices into the
-/// tokens of the turn above it. Poisoning is ignored: a panic in one writer
-/// must not take the terminal down with it.
+/// Whole blocks of output take this, so a line never splices into the tokens
+/// of the turn above it. Poisoning is ignored: a panic in one writer must not
+/// take the terminal down with it.
 pub fn row_lock() -> std::sync::MutexGuard<'static, ()> {
     ROW.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// A line typed while the agent works is a side question when it says so.
-fn is_side(line: &str) -> bool {
-    line == "/btw" || line.starts_with("/btw ")
 }
 
 /// True while the row under the output belongs to the prompt: an open turn,
@@ -316,10 +301,10 @@ mod tests {
     fn typed_lines_come_back_in_order() {
         let t = Typed::new();
         assert_eq!(t.take(), None);
-        t.push("/btw one".into());
-        t.push("/btw two".into());
-        assert_eq!(t.take().as_deref(), Some("/btw one"));
-        assert_eq!(t.take().as_deref(), Some("/btw two"));
+        t.push("first line".into());
+        t.push("second line".into());
+        assert_eq!(t.take().as_deref(), Some("first line"));
+        assert_eq!(t.take().as_deref(), Some("second line"));
         assert_eq!(t.take(), None);
     }
 
@@ -332,16 +317,6 @@ mod tests {
         );
         crate::ui::turn_close();
         assert!(!crate::ui::turn_running(), "the turn flag outlived the turn");
-    }
-
-    #[test]
-    fn only_btw_lines_are_side_questions() {
-        assert!(is_side("/btw"));
-        assert!(is_side("/btw what files are here"));
-        assert!(!is_side("/btwx"));
-        assert!(!is_side("/btwq"));
-        assert!(!is_side("explain /btw"));
-        assert!(!is_side("/status"));
     }
 
     /// Feed chunks through one parser, as the watcher does across reads, and

@@ -27,8 +27,6 @@ pub enum Action {
     Thinking(String),
     /// Summarize history into one line of context. Arg = extra instructions.
     Compact(String),
-    /// Side question: same context, no history mutation. Arg = question.
-    Btw(String),
     /// List past sessions (`None`) or load one (`Some(id)`).
     Resume(Option<String>),
     /// Drop the last `n` user turns (default 1).
@@ -55,7 +53,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/thinking", "show or set thinking effort (off|minimal|low|medium|high|xhigh|max)"),
     ("/compact", "summarize history to free context"),
     ("/autocompact", "compact automatically at N% of the context window (/autocompact 80, off)"),
-    ("/btw", "side question: same context, history untouched"),
     ("/skills", "list the skills this session can load"),
     ("/mcp", "list MCP servers, their state and their tools"),
     ("/resume", "list this directory's sessions or resume one by id (/resume all)"),
@@ -291,13 +288,6 @@ pub fn handle(line: &str, cfg: &mut Config, store: &crate::store::Store) -> Acti
         "/model" | "/models" => model(arg, cfg, store),
         "/thinking" => Action::Thinking(arg.to_string()),
         "/compact" => Action::Compact(arg.to_string()),
-        "/btw" => {
-            if arg.is_empty() {
-                Action::Problem("usage: /btw <question> (side question, history untouched)".into())
-            } else {
-                Action::Btw(arg.to_string())
-            }
-        }
         "/mcp" => Action::Mcp,
         "/autocompact" => {
             if arg.is_empty() {
@@ -1140,16 +1130,5 @@ mod tests {
         // The completer and /help read the same table, so it must be there.
         assert!(COMMANDS.iter().any(|(n, _)| *n == "/stats"));
         assert!(candidates("/sta").iter().any(|(n, _)| *n == "/stats"));
-    }
-
-    #[test]
-    fn btw_without_question_shows_usage() {
-        let store = Store::memory();
-        let mut cfg = test_cfg();
-        match handle("/btw", &mut cfg, &store) {
-            Action::Problem(m) => assert!(m.contains("usage"), "{m}"),
-            _ => panic!("expected usage"),
-        }
-        assert!(matches!(handle("/btw what is this?", &mut cfg, &store), Action::Btw(_)));
     }
 }

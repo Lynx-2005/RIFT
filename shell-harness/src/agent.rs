@@ -87,7 +87,6 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
             Action::Exit => break,
             Action::Reset(msg) => {
                 session.history.clear();
-                session.btw.clear();
                 session_id = store.create_session(
                     session.cfg.provider.name(),
                     &session.cfg.model,
@@ -199,7 +198,6 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                 }
             }
             Action::Compact(extra) => session.compact(&extra, &store, session_id),
-            Action::Btw(q) => session.btw(&q, &work),
             Action::Resume(opt) => match opt {
                 None => resume_list(&store, Some(&where_from)),
                 Some(id) => {
@@ -222,7 +220,6 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                     if removed == 0 {
                         ui::info("nothing to rewind");
                     } else {
-                        session.btw.clear();
                         store.save_messages(session_id, &session.history);
                         let mut files = String::new();
                         if let Ok(dir) = std::env::current_dir() {
@@ -501,17 +498,13 @@ pub struct Session {
     pub cfg: Config,
     client: Client,
     pub history: Vec<Msg>,
-    /// Side-thread exchanges from `/btw`: prepended to the main transcript
-    /// for context on every side question, never written back to it.
-    btw: Vec<Msg>,
     /// The toolset for this session: the harness's own tools plus any MCP
-    /// server's. Shared with the side-question thread, hence the Arc.
+    /// server's.
     tools: Tools,
     /// What rides along with the system prompt. Recomputed per turn, because a
     /// skill written while rift is open should be usable in the next turn.
     context: String,
-    /// The most recent request's usage, for autocompact. Shared with the turn
-    /// thread by reference, so a side question's calls never land in it.
+    /// The most recent request's usage, for autocompact.
     last: LastUsage,
 }
 
@@ -522,7 +515,6 @@ impl Session {
             cfg,
             client,
             history: Vec::new(),
-            btw: Vec::new(),
             tools,
             context,
             last: Arc::new(std::sync::Mutex::new(None)),
@@ -593,49 +585,8 @@ impl Session {
                 return Err(e);
             }
         }
-        self.absorb_side(work);
         store.save_messages(session_id, &self.history);
         Ok(())
-    }
-
-    /// Side answers earned during a turn are context for the next one.
-    fn absorb_side(&mut self, work: &WhileWorking) {
-        if let Ok(mut sh) = work.side_hist.lock() {
-            self.btw.append(&mut sh);
-        }
-    }
-
-    /// Side question: same context (main history + earlier side exchanges),
-    /// answered with tools, but the main history is never touched.
-    fn btw(&mut self, question: &str, work: &WhileWorking) {
-        let mut hist = self.history.clone();
-        hist.extend(self.btw.clone());
-        hist.push(Msg::User(question.to_string()));
-        self.btw.push(Msg::User(question.to_string()));
-        self.context = crate::skills::catalog(&self.cfg.cwd);
-        // A side question is not the conversation: its usage goes nowhere.
-        let side_last: LastUsage = Arc::new(std::sync::Mutex::new(None));
-        match run_loop(
-            &self.cfg,
-            &self.client,
-            &mut hist,
-            self.cfg.log.clone(),
-            work,
-            &self.tools,
-            &self.context,
-            &side_last,
-        ) {
-            Ok(LoopEnd::Cancelled) => ui::info("btw stopped (Esc)"),
-            Ok(LoopEnd::Done) => {
-                if let Some(Msg::Assistant { text, .. }) =
-                    hist.iter().rev().find(|m| matches!(m, Msg::Assistant { .. }))
-                {
-                    self.btw.push(Msg::Assistant { text: text.clone(), calls: vec![] });
-                }
-            }
-            Err(e) => ui::error(&format!("{e:#}")),
-        }
-        self.absorb_side(work);
     }
 
     /// Compacts on its own when the stored threshold says so. Called after a
@@ -761,7 +712,6 @@ impl Session {
                 self.history = vec![Msg::User(format!(
                     "Earlier conversation, compacted from {n} messages:\n{summary}"
                 ))];
-                self.btw.clear();
                 // The old context is gone: the pressure figure from before the
                 // compact says nothing about what is on screen now, and keeping
                 // it would make the next status read like it is still full.
@@ -815,7 +765,6 @@ impl Session {
             persist_session(store, &self.cfg);
         }
         self.history = store.load_messages(id);
-        self.btw.clear();
         ui::ok(&format!(
             "resumed session #{id} ({} - {} - {} msgs)",
             row.provider,
@@ -878,8 +827,7 @@ impl Tools {
         Tools { mcp: Arc::new(Mutex::new(mcp)), notes, specs }
     }
 
-    /// Just the harness's own tools: what a side question asked from inside a
-    /// `--prompt` run gets, and what tests use.
+    /// Just the harness's own tools, without MCP: what tests use.
     #[cfg(test)]
     pub fn builtin_only() -> Self {
         let mcp = crate::mcp::Manager::none();
@@ -905,21 +853,14 @@ impl Tools {
     }
 }
 
-/// What can be typed while a turn is running: lines that wait for the turn to
-/// finish, side questions that run beside it, and what those have been told.
+/// Lines typed while a turn is running, waiting for the turn to finish.
 pub struct WhileWorking {
     pub typed: Arc<crate::term::Typed>,
-    pub side: Arc<crate::term::Typed>,
-    pub side_hist: Arc<std::sync::Mutex<Vec<Msg>>>,
 }
 
 impl WhileWorking {
     fn new() -> Self {
-        Self {
-            typed: crate::term::Typed::new(),
-            side: crate::term::Typed::new(),
-            side_hist: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
+        Self { typed: crate::term::Typed::new() }
     }
 }
 
@@ -945,95 +886,13 @@ fn run_loop(
     let _raw = crate::term::RawGuard::new();
     let watcher = {
         let (c, d) = (cancel.clone(), finished.clone());
-        let (t, s) = (work.typed.clone(), work.side.clone());
-        std::thread::spawn(move || crate::term::input_watcher(c, d, t, s))
+        let t = work.typed.clone();
+        std::thread::spawn(move || crate::term::input_watcher(c, d, t))
     };
-    let snapshot: Arc<std::sync::Mutex<Vec<Msg>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    spawn_side_questions(cfg, client, &log, &cancel, &finished, &snapshot, work, tools, context);
-    let end = drive(cfg, client, hist, &log, &cancel, Some(&snapshot), tools, context, last);
+    let end = drive(cfg, client, hist, &log, &cancel, tools, context, last);
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     end
-}
-
-/// Answers side questions for the length of one turn. Runs *beside* the turn,
-/// never inside it: its own history, its output captured instead of printed,
-/// and a block printed when it is ready. Detached on purpose, so a slow side
-/// question can never hold up the turn it was asked during.
-#[allow(clippy::too_many_arguments)]
-fn spawn_side_questions(
-    cfg: &Config,
-    client: &Client,
-    log: &Option<std::path::PathBuf>,
-    cancel: &Arc<AtomicBool>,
-    finished: &Arc<AtomicBool>,
-    snapshot: &Arc<std::sync::Mutex<Vec<Msg>>>,
-    work: &WhileWorking,
-    tools: &Tools,
-    context: &str,
-) {
-    let (cfg, client, log) = (cfg.clone(), client.clone(), log.clone());
-    // A side question uses the same toolset: the manager is behind an Arc, so
-    // this is the same server connection, not a second one.
-    let tools = tools.clone();
-    let context = context.to_string();
-    let (cancel, finished) = (cancel.clone(), finished.clone());
-    let (side, side_hist) = (work.side.clone(), work.side_hist.clone());
-    let snapshot = snapshot.clone();
-    std::thread::spawn(move || loop {
-        // A finished turn drains what is still queued before the thread goes:
-        // dropping an acknowledged question would leave it answered nowhere.
-        // A cancelled turn abandons everything, because the user asked for it.
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        if finished.load(Ordering::Relaxed) && side.take().is_none() {
-            return;
-        }
-        let Some(line) = side.take() else {
-            std::thread::sleep(Duration::from_millis(25));
-            continue;
-        };
-        let question = line.trim_start_matches("/btw").trim().to_string();
-        if question.is_empty() {
-            continue;
-        }
-        let mut hist = snapshot.lock().map(|h| h.clone()).unwrap_or_default();
-        hist.extend(side_hist.lock().map(|h| h.clone()).unwrap_or_default());
-        hist.push(Msg::User(question.clone()));
-        crate::ui::start_capture();
-        // A side question is not the conversation: its usage goes nowhere.
-        let side_last: LastUsage = Arc::new(std::sync::Mutex::new(None));
-        let end = drive(&cfg, &client, &mut hist, &log, &cancel, None, &tools, &context, &side_last);
-        if let Err(e) = &end {
-            crate::ui::error(&format!("{e:#}"));
-        }
-        let body = crate::ui::take_capture().unwrap_or_default();
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(Msg::Assistant { text, .. }) =
-            hist.iter().rev().find(|m| matches!(m, Msg::Assistant { .. }))
-        {
-            if let Ok(mut sh) = side_hist.lock() {
-                sh.push(Msg::User(question.clone()));
-                sh.push(Msg::Assistant { text: text.clone(), calls: vec![] });
-            }
-        }
-        // The block lands whether or not the answer had text: a question that
-        // was acknowledged and then never answered on screen would look lost.
-        let body = if body.trim().is_empty() { "(no answer)".to_string() } else { body };
-        crate::ui::print_side(&question, &body);
-    });
-}
-
-/// Keep the newest history where a side question can read it: the side thread
-/// cannot borrow the turn's `hist`, and could not afford to wait for it either.
-fn publish(snapshot: &std::sync::Mutex<Vec<Msg>>, hist: &[Msg]) {
-    if let Ok(mut h) = snapshot.lock() {
-        h.clear();
-        h.extend_from_slice(hist);
-    }
 }
 
 enum StreamEvent {
@@ -1050,14 +909,10 @@ fn drive(
     hist: &mut Vec<Msg>,
     log: &Option<std::path::PathBuf>,
     cancel: &Arc<AtomicBool>,
-    snapshot: Option<&Arc<std::sync::Mutex<Vec<Msg>>>>,
     tools: &Tools,
     context: &str,
     last: &LastUsage,
 ) -> Result<LoopEnd> {
-    if let Some(s) = snapshot {
-        publish(s, hist);
-    }
     let mut round = 0usize;
     loop {
         let (tx, rx) = mpsc::channel::<StreamEvent>();
@@ -1190,9 +1045,6 @@ fn drive(
             &serde_json::json!({"role": "assistant", "text": text, "thinking": thinking, "calls": calls.iter().map(|c| c.label()).collect::<Vec<_>>() }),
         );
         hist.push(Msg::Assistant { text, calls: calls.clone() });
-        if let Some(s) = snapshot {
-            publish(s, hist);
-        }
 
         if calls.is_empty() {
             return Ok(LoopEnd::Done);
@@ -1209,9 +1061,6 @@ fn drive(
                 &serde_json::json!({"role": "tool", "tool": call.name, "command": call.label(), "output": output}),
             );
             hist.push(Msg::ToolResult { id: call.id, output });
-            if let Some(s) = snapshot {
-                publish(s, hist);
-            }
         }
         if cancelled {
             return Ok(LoopEnd::Cancelled);
