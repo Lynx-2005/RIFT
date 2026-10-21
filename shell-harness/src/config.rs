@@ -214,19 +214,15 @@ impl Provider {
 
     /// Reads this provider's key from the environment, if set.
     ///
-    /// TokenHarbor's installer exports its own key as `OPENAI_API_KEY` so
-    /// OpenAI-compatible clients use its gateway. That is not an OpenAI key:
-    /// sending it to api.openai.com only produces a 401. Ignore the alias and
-    /// let the picker ask for the real key.
+    /// An OpenAI-compatible gateway often exports its key as `OPENAI_API_KEY`
+    /// and scopes it with `OPENAI_BASE_URL`/`OPENAI_API_BASE`. Rift's OpenAI
+    /// provider talks to api.openai.com, so a key scoped to another endpoint
+    /// would only be sent to the wrong host and fail. Leave it unset and let
+    /// the picker ask for the key that belongs to this provider.
     pub fn env_key(&self) -> Option<String> {
         let key = std::env::var(self.key_env()).ok().filter(|k| !k.is_empty())?;
-        if self.name == "openai" {
-            let tokenharbor = std::env::var("TOKENHARBOR_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty());
-            if tokenharbor.as_deref() == Some(key.as_str()) {
-                return None;
-            }
+        if self.name == "openai" && openai_key_scoped_elsewhere() {
+            return None;
         }
         Some(key)
     }
@@ -551,6 +547,17 @@ fn no_spinner_env() -> bool {
     std::env::var("SH_NO_SPINNER")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
+}
+
+/// True when the environment's OpenAI base URL names an endpoint other than
+/// OpenAI's own: the accompanying `OPENAI_API_KEY` belongs to that gateway.
+fn openai_key_scoped_elsewhere() -> bool {
+    ["OPENAI_BASE_URL", "OPENAI_API_BASE"].iter().any(|var| {
+        std::env::var(var).ok().is_some_and(|url| {
+            let url = url.trim().to_ascii_lowercase();
+            !url.is_empty() && !url.contains("api.openai.com")
+        })
+    })
 }
 
 pub fn normalize_url(url: &str) -> String {

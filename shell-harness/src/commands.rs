@@ -716,22 +716,26 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    const KEYS: &[&str] = &[
+    const ENV_VARS: &[&str] = &[
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
         "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
         "TOKENHARBOR_API_KEY",
         "OPENROUTER_API_KEY",
     ];
 
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Run `f` with all provider key env vars cleared (restored after).
+    /// Run `f` with all provider env vars cleared (restored after).
     /// Tests share a process, so env mutation is serialized through a mutex.
     fn with_clean_env(f: impl FnOnce()) {
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let saved: Vec<(&str, Option<String>)> =
-            KEYS.iter().map(|v| (*v, std::env::var(v).ok())).collect();
-        for v in KEYS {
+            ENV_VARS.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        for v in ENV_VARS {
             std::env::remove_var(v);
         }
         f();
@@ -836,17 +840,24 @@ mod tests {
     }
 
     #[test]
-    fn a_tokenharbor_alias_is_not_an_openai_key() {
+    fn an_openai_key_scoped_to_another_endpoint_is_ignored() {
         with_clean_env(|| {
-            std::env::set_var("TOKENHARBOR_API_KEY", "thk_live_test");
-            std::env::set_var("OPENAI_API_KEY", "thk_live_test");
+            std::env::set_var("OPENAI_API_KEY", "gateway-key");
+            std::env::set_var("OPENAI_BASE_URL", "https://gateway.example/v1");
             let openai = Provider::builtin("openai").unwrap();
-            let tokenharbor = Provider::builtin("tokenharbor").unwrap();
-            assert!(openai.env_key().is_none(), "the TokenHarbor shim is not an OpenAI key");
-            assert_eq!(tokenharbor.env_key().as_deref(), Some("thk_live_test"));
+            assert!(
+                openai.env_key().is_none(),
+                "a key scoped to another gateway is not an OpenAI key"
+            );
             let rows = provider_candidates(&Store::memory(), "anthropic");
             let desc = rows.into_iter().find(|(n, _)| n == "openai").unwrap().1;
             assert!(desc.contains("no key"), "{desc}");
+
+            // The same key is used when it is scoped to OpenAI itself.
+            std::env::set_var("OPENAI_BASE_URL", "https://api.openai.com/v1");
+            assert_eq!(openai.env_key().as_deref(), Some("gateway-key"));
+            std::env::remove_var("OPENAI_BASE_URL");
+            assert_eq!(openai.env_key().as_deref(), Some("gateway-key"));
         });
     }
 
