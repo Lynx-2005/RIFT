@@ -137,7 +137,10 @@ pub fn provider_candidates(store: &crate::store::Store, active: &str) -> Vec<(St
         .into_iter()
         .map(|p| {
             let keyed = provider_key(&p, store).is_some();
-            let mut desc = if p.is_custom() {
+            let from_file = crate::provider::file_provider(p.name()).is_some();
+            let mut desc = if from_file {
+                format!("from providers.json, {} API", p.wire().as_str())
+            } else if p.is_custom() {
                 format!("custom {} API", p.wire().as_str())
             } else {
                 "built-in".to_string()
@@ -1000,14 +1003,14 @@ mod tests {
             let store = Store::memory();
             // An older build wrote the row without a kind; its cached models
             // must not disappear from /model after the upgrade.
-            store.save_provider("legacy", "lfm-2", "http://127.0.0.1:8787/v1", "");
-            store.save_models("legacy", &["lfm-2".to_string(), "lfm-2-instruct".to_string()]);
+            store.save_provider("legacy", "local-2", "http://127.0.0.1:8787/v1", "");
+            store.save_models("legacy", &["local-2".to_string(), "local-2-instruct".to_string()]);
             let p = Provider::resolve("legacy", &store).expect("legacy row resolved");
             assert_eq!(p.wire(), Wire::OpenAi);
             assert!(p.is_custom());
             assert!(known_providers(&store).iter().any(|p| p.name() == "legacy"));
             let catalog = connected_catalog(&store);
-            assert!(catalog.iter().any(|(n, id)| n == "legacy" && id == "lfm-2"), "{catalog:?}");
+            assert!(catalog.iter().any(|(n, id)| n == "legacy" && id == "local-2"), "{catalog:?}");
         });
     }
 

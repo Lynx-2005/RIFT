@@ -1,6 +1,6 @@
 //! Provider adapters. Everything is normalized to `Msg` / `Turn`, so the agent
 //! loop never cares which vendor is on the other end.
-use crate::config::{Config, Wire};
+use crate::config::{Config, Provider, Wire};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The community model catalog (models.dev) that opencode and pi derive their
@@ -1135,15 +1135,61 @@ pub fn file_provider(name: &str) -> Option<FileProvider> {
     file_providers().into_iter().find(|p| p.name == name)
 }
 
+/// A URL on this machine means a local model server, never a built-in's
+/// official endpoint.
+fn local_endpoint(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    ["://127.0.0.1", "://localhost", "://[::1]", "://0.0.0.0"]
+        .iter()
+        .any(|host| url.contains(host))
+}
+
+/// True when a saved row describes some endpoint other than the built-in it is
+/// filed under. Older builds persisted per-run `--base-url`/`--model` flags, so
+/// an OpenAI row can still be wearing a local server's model.
+fn stale_builtin(provider: &Provider, saved: &crate::store::ProviderState) -> bool {
+    if provider.is_custom() {
+        return false;
+    }
+    if local_endpoint(&saved.base_url) {
+        return true;
+    }
+    !saved.model.is_empty()
+        && file_providers()
+            .iter()
+            .any(|f| f.name != provider.name() && f.models.contains(&saved.model))
+}
+
 /// A provider's connection details: the file wins over a stored row, so
 /// editing the file is always authoritative.
+///
+/// A built-in owns its endpoint. If its row points at a local server or names a
+/// model another provider declares, the row is stale and the built-in's own
+/// defaults are returned instead. The stale catalog is dropped with it.
 pub fn state(
     name: &str,
     store: &crate::store::Store,
 ) -> Option<crate::store::ProviderState> {
-    file_provider(name)
-        .map(|p| p.state)
-        .or_else(|| store.provider_state(name))
+    // A built-in is resolved before the file everywhere else, so a file entry
+    // using its name must not shadow it here either.
+    let builtin = Provider::builtin(name);
+    if builtin.is_none() {
+        if let Some(p) = file_provider(name) {
+            return Some(p.state);
+        }
+    }
+    let saved = store.provider_state(name)?;
+    let Some(provider) = builtin else { return Some(saved) };
+    if !stale_builtin(&provider, &saved) {
+        return Some(saved);
+    }
+    store.clear_models(name);
+    Some(crate::store::ProviderState {
+        model: provider.default_model().to_string(),
+        base_url: provider.default_url().to_string(),
+        api_key: String::new(),
+        kind: saved.kind,
+    })
 }
 
 pub fn is_file_backed(name: &str) -> bool {
@@ -1609,11 +1655,11 @@ mod catalog_tests {
 
     #[test]
     fn the_provider_file_accepts_a_bare_map_and_a_wrapper() {
-        let bare = r#"{"lfm":{"url":"http://127.0.0.1:8787/v1","model":"lfm2.5-vl-3b"}}"#;
+        let bare = r#"{"local":{"url":"http://127.0.0.1:8787/v1","model":"local-model"}}"#;
         let p = parse_providers(bare).unwrap();
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].name, "lfm");
-        assert_eq!(p[0].state.model, "lfm2.5-vl-3b");
+        assert_eq!(p[0].name, "local");
+        assert_eq!(p[0].state.model, "local-model");
         assert_eq!(p[0].state.base_url, "http://127.0.0.1:8787/v1");
         assert_eq!(p[0].state.kind, "openai", "openai-compatible is the default");
         assert!(p[0].state.api_key.is_empty(), "local servers need no key");
@@ -1656,6 +1702,31 @@ mod catalog_tests {
     fn a_conventional_local_name_can_omit_its_url() {
         let p = parse_providers(r#"{"ollama":{"model":"llama3.2"}}"#).unwrap();
         assert_eq!(p[0].state.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn a_builtin_row_pointing_at_a_local_server_returns_its_own_defaults() {
+        let store = crate::store::Store::memory();
+        store.save_provider("openai", "lfm2.5-vl-3b", "http://127.0.0.1:8787/v1", "thk");
+        store.save_models("openai", &["lfm2.5-vl-3b".to_string()]);
+        let s = state("openai", &store).expect("built-in state");
+        assert_eq!(s.model, "gpt-4.1");
+        assert_eq!(s.base_url, "https://api.openai.com/v1");
+        assert_eq!(s.api_key, "", "a local endpoint's key is not sent to OpenAI");
+        assert!(
+            store.cached_models("openai").is_none(),
+            "the local endpoint's catalog was left behind"
+        );
+    }
+
+    #[test]
+    fn a_builtin_row_with_a_real_endpoint_is_left_alone() {
+        let store = crate::store::Store::memory();
+        store.save_provider("openai", "real-model", "https://real.example/v1", "sk-real");
+        let s = state("openai", &store).expect("built-in state");
+        assert_eq!(s.model, "real-model");
+        assert_eq!(s.base_url, "https://real.example/v1");
+        assert_eq!(s.api_key, "sk-real");
     }
 }
 

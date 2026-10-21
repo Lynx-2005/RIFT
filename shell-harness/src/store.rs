@@ -238,6 +238,12 @@ impl Store {
         );
     }
 
+    /// Forget a provider's cached catalog. A list fetched from an endpoint the
+    /// provider no longer points at must not keep showing its models.
+    pub fn clear_models(&self, provider: &str) {
+        let _ = self.conn.execute("DELETE FROM models WHERE provider = ?1", params![provider]);
+    }
+
     /// Context windows learned for a provider's models, keyed by model id.
     pub fn save_contexts(&self, provider: &str, map: &[(String, u64)]) {
         if map.is_empty() {

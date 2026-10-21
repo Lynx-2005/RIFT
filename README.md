@@ -83,11 +83,11 @@ without restarting; `RIFT_PROVIDERS=/path/to/file.json` points somewhere else.
 
 ```json
 {
-  "lfm": {
+  "local": {
     "type": "openai",
     "url": "http://127.0.0.1:8787/v1",
-    "model": "lfm2.5-vl-3b",
-    "models": ["lfm2.5-vl-3b"]
+    "model": "local-model",
+    "models": ["local-model"]
   }
 }
 ```
