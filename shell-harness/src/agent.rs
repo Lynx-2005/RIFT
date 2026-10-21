@@ -67,13 +67,23 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
         let next = match work.typed.take() {
             Some(line) => Some(line),
             None => {
+                // Text still being typed when the last turn ended belongs in
+                // the prompt, not in the transcript: open with it so the user
+                // can finish it and press Enter when they mean to.
+                let mut start = prefill.take();
+                if let Some(draft) = work.typed.take_draft() {
+                    match start.as_mut() {
+                        Some(text) => text.push_str(&draft),
+                        None => start = Some(draft),
+                    }
+                }
                 let providers =
                     commands::provider_candidates(&store, session.cfg.provider.name());
                 rl.read_line(
                     &session.cfg,
                     &commands::connected_catalog(&store),
                     &providers,
-                    prefill.as_deref(),
+                    start.as_deref(),
                 )?
             }
         };
@@ -891,6 +901,9 @@ fn run_loop(
     };
     let end = drive(cfg, client, hist, &log, &cancel, tools, context, last);
     finished.store(true, Ordering::Relaxed);
+    // A console read can still be waiting for a key; wake it so the next
+    // prompt opens now instead of on the user's first keystroke.
+    crate::term::unblock_stdin(&watcher);
     let _ = watcher.join();
     end
 }

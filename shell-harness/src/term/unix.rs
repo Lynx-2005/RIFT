@@ -83,6 +83,10 @@ pub fn read_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
+/// No-op: every watcher read is preceded by `poll_in`, so a finished turn
+/// never leaves a read blocked on this platform.
+pub fn unblock_stdin(_: &std::thread::JoinHandle<()>) {}
+
 /// Unix terminals need no setup: the ANSI the renderer writes is native there.
 /// Present so `main` can call it on every platform.
 pub fn platform_init() {}

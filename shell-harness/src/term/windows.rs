@@ -6,7 +6,8 @@
 //!
 //! Windows 10 1809+ (ConPTY / VT console) is assumed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
@@ -17,6 +18,7 @@ use windows_sys::Win32::System::Console::{
     ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     ENABLE_WINDOW_INPUT, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 /// The three standard handles; the console API answers with null when the
@@ -130,6 +132,10 @@ pub fn poll_in(ms: i32) -> bool {
     unsafe { WaitForSingleObject(h, ms.max(0) as u32) == WAIT_OBJECT_0 }
 }
 
+/// A CR that ended the previous read, waiting to see whether the next byte is
+/// the LF of the same Enter. Only one input reader is active at a time.
+static PENDING_CR: AtomicBool = AtomicBool::new(false);
+
 /// Read up to `buf.len()` bytes from the console. The handle is read directly
 /// rather than through `std::io::stdin`, whose buffering would desync the
 /// availability checks above.
@@ -148,5 +154,26 @@ pub fn read_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(super::collapse_crlf(&mut buf[..n as usize]))
+    let mut pending = PENDING_CR.load(Ordering::Relaxed);
+    let n = super::collapse_crlf(&mut pending, &mut buf[..n as usize]);
+    PENDING_CR.store(pending, Ordering::Relaxed);
+    Ok(n)
+}
+
+/// Cancel the console read the input watcher may still have in flight. A turn
+/// can end while `ReadFile` is waiting for a key that produces no bytes; the
+/// next prompt must not wait for the user to press something first.
+///
+/// Retried briefly: the watcher can see the finished flag just before it
+/// starts the read, so the first cancel has nothing to cancel yet.
+pub fn unblock_stdin(handle: &std::thread::JoinHandle<()>) {
+    for _ in 0..3 {
+        unsafe {
+            CancelSynchronousIo(handle.as_raw_handle());
+        }
+        if handle.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }

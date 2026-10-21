@@ -25,14 +25,21 @@ pub(crate) fn is_tty() -> bool {
 /// Windows consoles can hand back `\r\n` for a single Enter; collapsing an LF
 /// that directly follows a CR keeps Enter one key there. A lone LF (Ctrl-J)
 /// still arrives as LF on its own.
+///
+/// `pending_cr` carries a CR that ended the previous read, because the reader
+/// on Windows takes one byte at a time: without it, Enter's LF survives into
+/// the next prompt as a stray newline.
 #[cfg(any(windows, test))]
-fn collapse_crlf(buf: &mut [u8]) -> usize {
+fn collapse_crlf(pending_cr: &mut bool, buf: &mut [u8]) -> usize {
     let mut w = 0;
     for r in 0..buf.len() {
-        if buf[r] == b'\n' && w > 0 && buf[w - 1] == b'\r' {
+        let c = buf[r];
+        if c == b'\n' && *pending_cr {
+            *pending_cr = false;
             continue;
         }
-        buf[w] = buf[r];
+        *pending_cr = c == b'\r';
+        buf[w] = c;
         w += 1;
     }
     w
@@ -117,6 +124,12 @@ pub fn input_watcher(
         if !poll_in(50) {
             continue;
         }
+        // The turn can end between the poll and the read. Do not start a read
+        // for it: a console read blocks until a key, and the next prompt would
+        // wait on the user while the live row stays on screen.
+        if done.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            break;
+        }
         // Larger than one escape sequence, so a mouse report or an arrow key
         // normally arrives whole; the state machine handles the rare split.
         let mut b = [0u8; 64];
@@ -176,10 +189,12 @@ pub fn input_watcher(
             break;
         }
     }
-    // A turn that ends on a half-typed line keeps it instead of dropping it.
+    // A turn that ends on a half-typed line keeps it for the next prompt. It is
+    // never submitted: only Enter sends a line, and a turn ending while the
+    // user is typing must not look like an Enter they did not press.
     let tail = buf.trim().to_string();
     if done.load(Ordering::Relaxed) && !tail.is_empty() {
-        submit(&tail, &typed, crate::ui::queued_note());
+        typed.push_draft(&tail);
     }
     live_end();
 }
@@ -189,6 +204,7 @@ pub fn input_watcher(
 #[derive(Default)]
 pub struct Typed {
     queue: std::sync::Mutex<Vec<String>>,
+    draft: std::sync::Mutex<String>,
 }
 
 impl Typed {
@@ -209,6 +225,24 @@ impl Typed {
             None
         } else {
             Some(q.remove(0))
+        }
+    }
+
+    /// Keep a line that was still being typed when the turn ended. The next
+    /// prompt opens with it in the buffer, so the user finishes the thought
+    /// instead of having it sent for them.
+    pub fn push_draft(&self, text: &str) {
+        if let Ok(mut d) = self.draft.lock() {
+            d.push_str(text);
+        }
+    }
+
+    pub fn take_draft(&self) -> Option<String> {
+        let mut d = self.draft.lock().ok()?;
+        if d.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *d))
         }
     }
 }
@@ -364,17 +398,49 @@ mod tests {
 
     #[test]
     fn crlf_collapses_to_a_single_enter() {
+        let mut pending = false;
         let mut b = *b"a\r\nb";
-        let n = collapse_crlf(&mut b);
+        let n = collapse_crlf(&mut pending, &mut b);
         assert_eq!(&b[..n], b"a\rb");
+        assert!(!pending);
 
-        // A lone LF, and an LF that follows a collapsed CR, both survive.
+        // A lone LF, the LF of a CRLF pair, and another lone LF: exactly one
+        // of the two LFs is part of the pair, so one still survives.
         let mut b = *b"\n\r\n\n";
-        let n = collapse_crlf(&mut b);
-        assert_eq!(&b[..n], b"\n\r");
+        let n = collapse_crlf(&mut pending, &mut b);
+        assert_eq!(&b[..n], b"\n\r\n");
+        assert!(!pending);
 
         let mut b = *b"plain";
-        let n = collapse_crlf(&mut b);
+        let n = collapse_crlf(&mut pending, &mut b);
         assert_eq!(&b[..n], b"plain");
+    }
+
+    #[test]
+    fn an_enter_split_across_reads_is_still_one_key() {
+        // Windows reads one byte at a time in the prompt, so the LF of a CRLF
+        // Enter lands in the next read. It must not become a stray newline.
+        let mut pending = false;
+        let mut first = *b"\r";
+        assert_eq!(collapse_crlf(&mut pending, &mut first), 1);
+        assert!(pending);
+        let mut second = *b"\n";
+        assert_eq!(collapse_crlf(&mut pending, &mut second), 0);
+        assert!(!pending);
+
+        // Once the pair is consumed, ordinary input is untouched.
+        let mut after = *b"xy";
+        assert_eq!(collapse_crlf(&mut pending, &mut after), 2);
+        assert_eq!(&after, b"xy");
+    }
+
+    #[test]
+    fn a_half_typed_line_waits_as_a_draft_instead_of_submitting() {
+        let t = Typed::new();
+        t.push_draft("w");
+        t.push_draft("hat");
+        assert_eq!(t.take(), None, "a draft must never queue a turn by itself");
+        assert_eq!(t.take_draft().as_deref(), Some("what"));
+        assert_eq!(t.take_draft(), None);
     }
 }
