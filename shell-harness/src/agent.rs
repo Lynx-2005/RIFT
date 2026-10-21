@@ -19,6 +19,9 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
         println!("{}", crate::provider::system(&cfg, &crate::skills::catalog(&cfg.cwd)));
         return Ok(());
     }
+    if let Some(problem) = crate::provider::file_problem() {
+        ui::warn(&problem);
+    }
     let client = Client::new()?;
     // Both of these are optional extras and neither may stop a session from
     // opening: a skill directory that is unreadable and a server that will not
@@ -63,11 +66,16 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
     loop {
         let next = match work.typed.take() {
             Some(line) => Some(line),
-            None => rl.read_line(
-                &session.cfg,
-                &commands::connected_catalog(&store),
-                prefill.as_deref(),
-            )?,
+            None => {
+                let providers =
+                    commands::provider_candidates(&store, session.cfg.provider.name());
+                rl.read_line(
+                    &session.cfg,
+                    &commands::connected_catalog(&store),
+                    &providers,
+                    prefill.as_deref(),
+                )?
+            }
         };
         let Some(raw) = next else { break };
         prefill = None;
@@ -96,17 +104,55 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                 spawn_catalog_refresh();
             }
             Action::Models => {
-                refresh_catalogs(&store, &session.client);
-                if commands::connected_catalog(&store).is_empty() {
-                    ui::info("no providers connected. Set one of these, or run /provider:\n  ANTHROPIC_API_KEY, OPENAI_API_KEY, TOKENHARBOR_API_KEY, OPENROUTER_API_KEY");
+                // Open from cache when there is one: the network refresh runs
+                // in the background, so a slow models.dev or a dead local
+                // server never stalls the picker.
+                let mut catalog = commands::connected_catalog(&store);
+                if catalog.is_empty() {
+                    // Nothing cached: fetch the provider lists once. This skips
+                    // models.dev (context windows, not menu rows), which is the
+                    // slow download that used to make this command feel hung.
+                    refresh_model_lists(&store, &session.client);
+                    catalog = commands::connected_catalog(&store);
+                }
+                if catalog.is_empty() {
+                    let configured = commands::provider_candidates(&store, session.cfg.provider.name());
+                    ui::info(&format!(
+                        "no models yet. Configured providers:\n  {}\nSet a key with /provider <name>, or add a custom endpoint with /provider add <name> url=<url>",
+                        configured
+                            .iter()
+                            .map(|(n, d)| format!("{n} ({d})"))
+                            .collect::<Vec<_>>()
+                            .join("\n  ")
+                    ));
                 } else {
+                    // Refresh stale lists without holding the prompt.
+                    spawn_catalog_refresh();
                     // Open the live picker: type to filter, up/down to pick, Enter sets.
                     prefill = Some("/model ".to_string());
                 }
             }
+            Action::Providers => {
+                if crate::term::is_tty() {
+                    // The picker itself is the completion menu: prefill the
+                    // command and let up/down + Enter choose. No refresh
+                    // needed: the rows describe configuration, not a catalog.
+                    prefill = Some("/provider ".to_string());
+                } else {
+                    // No menu to draw: print the same rows as text.
+                    let rows = commands::provider_candidates(&store, session.cfg.provider.name());
+                    ui::info(
+                        &rows
+                            .iter()
+                            .map(|(n, d)| format!("  {n:<12} {d}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
+            }
             Action::NeedKey { msg, env } => {
                 ui::ok(&msg);
-                match ui::prompt_secret(&format!("Paste {env} (empty to skip): ")) {
+                match ui::prompt_secret(&format!("Paste {env} (Enter saves, Esc skips): ")) {
                     Some(k) => {
                         session.cfg.api_key = k;
                         persist_session(&store, &session.cfg);
@@ -115,7 +161,14 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                             session.cfg.provider.name(),
                             &session.cfg.model,
                         );
-                        ui::ok("key saved for this session");
+                        // The key just made this provider usable: fetch its
+                        // model list now so /model reflects it without a
+                        // restart or a second /provider trip.
+                        spawn_catalog_refresh();
+                        ui::ok(&format!(
+                            "key saved for {}. Its models join /model once the list lands",
+                            session.cfg.provider.name()
+                        ));
                     }
                     None => {
                         ui::info("no key entered. Set it later with /provider <name> key=<key>")
@@ -133,7 +186,7 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                     session.cfg.thinking = arg.clone();
                     store.set_thinking(session.cfg.provider.name(), &arg);
                     match crate::provider::effort_note(&arg) {
-                        Some(note) if session.cfg.provider != config::Provider::Anthropic => {
+                        Some(note) if session.cfg.provider.wire() != config::Wire::Anthropic => {
                             ui::ok(&format!("thinking set to {arg} ({note})"))
                         }
                         _ => ui::ok(&format!("thinking set to {arg}")),
@@ -264,7 +317,7 @@ fn persist_session(store: &crate::store::Store, cfg: &Config) {
     // A flagged value is this run's override, so whatever is already stored
     // wins for that field. With nothing stored yet the flag is also the only
     // thing that can configure the provider, so then it is kept.
-    let saved = store.provider_state(cfg.provider.name());
+    let saved = crate::provider::state(cfg.provider.name(), store);
     let model = match (&saved, cfg.model_flagged) {
         (Some(s), true) => s.model.clone(),
         _ => cfg.model.clone(),
@@ -277,7 +330,9 @@ fn persist_session(store: &crate::store::Store, cfg: &Config) {
         (Some(s), true) => s.api_key.clone(),
         _ => cfg.api_key.clone(),
     };
-    store.save_provider(cfg.provider.name(), &model, &url, &key);
+    if !crate::provider::is_file_backed(cfg.provider.name()) {
+        store.save_provider(cfg.provider.name(), &model, &url, &key);
+    }
     store.set_active(cfg.provider.name());
 }
 
@@ -297,6 +352,9 @@ pub(crate) fn spawn_catalog_refresh() {
 /// thread while the user is typing: every write goes through the row lock,
 /// and a failed fetch is reported rather than silently shrinking the menu.
 pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
+    // Provider lists first: a server that was just started should show up in
+    // /model before the slower models.dev download finishes.
+    refresh_model_lists(store, client);
     // Context windows from models.dev land even when no provider list needs a
     // refresh: the map changes on its own schedule, covers every provider at
     // once, and costs one keyless request.
@@ -304,23 +362,40 @@ pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
     if !dev.is_empty() {
         store.save_contexts("models.dev", &dev);
     }
-    let need: Vec<(String, String, String)> = crate::commands::PROVIDERS
-        .iter()
-        .filter_map(|name| {
-            if *name == "anthropic" || store.models_fresh(name) {
+}
+
+/// The provider `/models` half of a refresh, without the models.dev download.
+/// The interactive `/model` path calls this when it has nothing cached: the
+/// menu needs model ids, not context windows.
+pub(crate) fn refresh_model_lists(store: &crate::store::Store, client: &Client) {
+    // Built-ins with a key, plus every custom endpoint: a local server with no
+    // key is still worth asking for its model list.
+    let need: Vec<(String, String, String)> = crate::commands::known_providers(store)
+        .into_iter()
+        .filter_map(|p| {
+            let name = p.name();
+            if name == "anthropic" || store.models_fresh(name) {
                 return None;
             }
-            let p = crate::config::Provider::parse(name)?;
-            let key = std::env::var(p.key_env())
-                .ok()
-                .filter(|k| !k.is_empty())
-                .or_else(|| store.provider_state(name).map(|s| s.api_key))
-                .filter(|k| !k.is_empty())?;
-            let url = store
-                .provider_state(name)
+            // A file entry that lists its own models is already complete: no
+            // request to a server that may not be running, and no warning.
+            if crate::provider::file_provider(name)
+                .is_some_and(|f| !f.models.is_empty())
+            {
+                return None;
+            }
+            let key = crate::commands::provider_key(&p, store);
+            if p.requires_key() && key.is_none() {
+                return None;
+            }
+            let url = crate::provider::state(name, store)
                 .map(|s| s.base_url)
+                .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| p.default_url().to_string());
-            Some((name.to_string(), url, key))
+            if url.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), url, key.unwrap_or_default()))
         })
         .collect();
     if need.is_empty() {
@@ -725,14 +800,17 @@ impl Session {
                 row.cwd
             ));
         }
-        let provider = match config::Provider::parse(&row.provider) {
+        let provider = match config::Provider::resolve(&row.provider, store) {
             Some(p) => p,
             None => {
-                ui::error(&format!("session #{id} has unknown provider {}", row.provider));
+                ui::error(&format!(
+                    "session #{id} used provider {}, which is no longer configured",
+                    row.provider
+                ));
                 return None;
             }
         };
-        if self.cfg.switch_provider(provider, store).is_ok() {
+        if self.cfg.switch_provider(&provider, store).is_ok() {
             self.cfg.model = row.model.clone();
             persist_session(store, &self.cfg);
         }
@@ -848,9 +926,9 @@ impl WhileWorking {
 /// One model→tools loop over `hist`. Streaming runs on a worker thread and
 /// forwards owned chunks over a channel, so the main thread stays responsive
 /// to Esc and to typing (the watcher edits a live line, tools just read flags).
-#[allow(clippy::too_many_arguments)]
 type LastUsage = Arc<std::sync::Mutex<Option<crate::stats::Usage>>>;
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     cfg: &Config,
     client: &Client,
@@ -882,6 +960,7 @@ fn run_loop(
 /// never inside it: its own history, its output captured instead of printed,
 /// and a block printed when it is ready. Detached on purpose, so a slow side
 /// question can never hold up the turn it was asked during.
+#[allow(clippy::too_many_arguments)]
 fn spawn_side_questions(
     cfg: &Config,
     client: &Client,

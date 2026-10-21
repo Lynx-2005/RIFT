@@ -8,10 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MODELS_TTL_SECS: u64 = 24 * 3600;
 
+#[derive(Clone)]
 pub struct ProviderState {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+    /// The wire shape of a custom provider (`openai` or `anthropic`). Empty
+    /// for rows written by builds that only knew the four built-ins.
+    pub kind: String,
 }
 
 pub struct Store {
@@ -68,7 +72,8 @@ impl Store {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS providers(
                name TEXT PRIMARY KEY, model TEXT NOT NULL,
-               base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '');
+               base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '',
+               kind TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS session(
                key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS models(
@@ -88,6 +93,9 @@ impl Store {
         // is added in place, and older rows keep '' so they belong to no
         // directory and cannot be picked up as one.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''", []);
+        // Same story for custom providers: an older `providers` table has no
+        // kind, and its rows are all built-ins, so '' is the right value.
+        let _ = conn.execute("ALTER TABLE providers ADD COLUMN kind TEXT NOT NULL DEFAULT ''", []);
         Ok(())
     }
 
@@ -96,8 +104,10 @@ impl Store {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
         let conn = Connection::open(dir.join("rift.db"))?;
-        // A background refresh thread can write while the loop saves.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // A background refresh thread can write while the loop saves. WAL lets
+        // the two coexist; the timeout covers the brief writer handoff.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
         Self::init(&conn)?;
         Ok(Self { conn })
     }
@@ -112,24 +122,82 @@ impl Store {
     pub fn provider_state(&self, name: &str) -> Option<ProviderState> {
         self.conn
             .query_row(
-                "SELECT model, base_url, api_key FROM providers WHERE name = ?1",
+                "SELECT model, base_url, api_key, kind FROM providers WHERE name = ?1",
                 params![name],
                 |r| {
                     Ok(ProviderState {
                         model: r.get(0)?,
                         base_url: r.get(1)?,
                         api_key: r.get(2)?,
+                        kind: r.get(3).unwrap_or_default(),
                     })
                 },
             )
             .ok()
     }
 
+    /// Every provider row, custom ones included, sorted by name.
+    pub fn provider_rows(&self) -> Vec<(String, ProviderState)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT name, model, base_url, api_key, kind FROM providers ORDER BY name")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ProviderState {
+                    model: r.get(1)?,
+                    base_url: r.get(2)?,
+                    api_key: r.get(3)?,
+                    kind: r.get(4).unwrap_or_default(),
+                },
+            ))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Save a built-in's connection details. `kind` is deliberately not part
+    /// of the update: a custom row saved here keeps its wire shape.
     pub fn save_provider(&self, name: &str, model: &str, url: &str, key: &str) {
         let _ = self.conn.execute(
             "INSERT INTO providers(name, model, base_url, api_key) VALUES(?1,?2,?3,?4)
              ON CONFLICT(name) DO UPDATE SET model=excluded.model, base_url=excluded.base_url, api_key=excluded.api_key",
             params![name, model, url, key],
+        );
+    }
+
+    /// Create or update a custom provider, storing the wire shape it speaks.
+    pub fn save_custom_provider(
+        &self,
+        name: &str,
+        kind: &str,
+        model: &str,
+        url: &str,
+        key: &str,
+    ) {
+        let _ = self.conn.execute(
+            "INSERT INTO providers(name, model, base_url, api_key, kind) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(name) DO UPDATE SET model=excluded.model, base_url=excluded.base_url,
+                                            api_key=excluded.api_key, kind=excluded.kind",
+            params![name, model, url, key, kind],
+        );
+    }
+
+    /// Forget a custom provider: its row, catalog, context windows and level.
+    pub fn remove_provider(&self, name: &str) {
+        for sql in [
+            "DELETE FROM providers WHERE name = ?1",
+            "DELETE FROM models WHERE provider = ?1",
+            "DELETE FROM contexts WHERE provider = ?1",
+        ] {
+            let _ = self.conn.execute(sql, params![name]);
+        }
+        let _ = self.conn.execute(
+            "DELETE FROM session WHERE key = 'thinking:' || ?1",
+            params![name],
         );
     }
 
@@ -175,19 +243,33 @@ impl Store {
         if map.is_empty() {
             return;
         }
-        if let Err(e) = self.conn.execute(
-            "DELETE FROM contexts WHERE provider = ?1",
-            params![provider],
-        ) {
-            eprintln!("warning: could not update context windows ({e})");
+        // One transaction: thousands of autocommitted rows used to hold the
+        // write lock long enough for the foreground save to fail with "database
+        // is locked". A failed cache update is silent: it is not worth a line
+        // on the user's prompt.
+        let Ok(tx) = self.conn.unchecked_transaction() else { return };
+        if tx
+            .execute("DELETE FROM contexts WHERE provider = ?1", params![provider])
+            .is_err()
+        {
             return;
         }
-        for (id, ctx) in map {
-            let _ = self.conn.execute(
+        {
+            let Ok(mut stmt) = tx.prepare(
                 "INSERT OR REPLACE INTO contexts(provider, model, context) VALUES(?1,?2,?3)",
-                params![provider, id, *ctx as i64],
-            );
+            ) else {
+                return;
+            };
+            for (id, ctx) in map {
+                if stmt
+                    .execute(params![provider, id, *ctx as i64])
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
+        let _ = tx.commit();
     }
 
     /// The context window learned for one model, exact id first, then bare id
@@ -331,16 +413,32 @@ impl Store {
 
     /// Replace the stored transcript with `history` (small histories: simplest sync).
     pub fn save_messages(&self, session_id: i64, history: &[crate::provider::Msg]) {
-        let _ = self.conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        );
-        for (i, m) in history.iter().enumerate() {
-            let _ = self.conn.execute(
-                "INSERT INTO messages(session_id, idx, json) VALUES(?1,?2,?3)",
-                params![session_id, i as i64, crate::provider::msg_json(m).to_string()],
-            );
+        // Replace in one transaction: a half-written transcript (or a write
+        // that loses the lock to a background refresh) is worse than a failed
+        // save, and the next turn retries anyway.
+        let Ok(tx) = self.conn.unchecked_transaction() else { return };
+        if tx
+            .execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])
+            .is_err()
+        {
+            return;
         }
+        {
+            let Ok(mut stmt) = tx.prepare(
+                "INSERT INTO messages(session_id, idx, json) VALUES(?1,?2,?3)",
+            ) else {
+                return;
+            };
+            for (i, m) in history.iter().enumerate() {
+                if stmt
+                    .execute(params![session_id, i as i64, crate::provider::msg_json(m).to_string()])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        let _ = tx.commit();
     }
 
     pub fn load_messages(&self, session_id: i64) -> Vec<crate::provider::Msg> {
@@ -381,6 +479,30 @@ mod tests {
         assert_eq!(s.active_provider().as_deref(), Some("openrouter"));
         s.save_provider("openrouter", "openai/gpt-4.1", "https://openrouter.ai/api/v1", "k2");
         assert_eq!(s.provider_state("openrouter").unwrap().api_key, "k2");
+    }
+
+    #[test]
+    fn a_custom_provider_keeps_its_kind_and_can_be_removed() {
+        let s = Store::memory();
+        s.save_custom_provider("ollama", "openai", "llama3.2", "http://localhost:11434/v1", "");
+        let st = s.provider_state("ollama").unwrap();
+        assert_eq!(st.kind, "openai");
+        assert_eq!(st.api_key, "", "a local endpoint needs no key");
+        // Saving the connection details again must not erase the wire shape.
+        s.save_provider("ollama", "qwen2.5", "http://localhost:11434/v1", "");
+        let st = s.provider_state("ollama").unwrap();
+        assert_eq!(st.model, "qwen2.5");
+        assert_eq!(st.kind, "openai");
+        // Removal takes the row and everything cached about it.
+        s.save_models("ollama", &["qwen2.5".to_string()]);
+        s.save_contexts("ollama", &[("qwen2.5".to_string(), 32_000)]);
+        s.set_thinking("ollama", "low");
+        s.remove_provider("ollama");
+        assert!(s.provider_state("ollama").is_none());
+        assert!(s.cached_models("ollama").is_none());
+        assert!(s.context_of("ollama", "qwen2.5").is_none());
+        assert!(s.get_thinking("ollama").is_none());
+        assert!(s.provider_rows().is_empty());
     }
 
     #[test]

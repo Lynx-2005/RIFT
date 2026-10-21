@@ -35,36 +35,6 @@ impl Drop for RawGuard {
 
 static mut RAW_OLD: libc::termios = unsafe { std::mem::zeroed() };
 
-/// Echo off while a secret (API key) is typed. `None` when stdin is not a
-/// terminal, so the caller knows not to expect a swallowed newline.
-pub struct EchoGuard {
-    old: libc::termios,
-}
-
-impl EchoGuard {
-    pub fn new() -> Option<Self> {
-        if !super::is_tty() {
-            return None;
-        }
-        unsafe {
-            let mut old: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(0, &mut old);
-            let mut noecho = old;
-            noecho.c_lflag &= !libc::ECHO;
-            libc::tcsetattr(0, libc::TCSANOW, &noecho);
-            Some(EchoGuard { old })
-        }
-    }
-}
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &raw const self.old);
-        }
-    }
-}
-
 /// Resize is process-wide. The handler only records that it happened; the
 /// reader loop turns the flag into a repaint. A handler may not allocate.
 static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

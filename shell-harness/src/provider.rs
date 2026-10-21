@@ -1,6 +1,6 @@
 //! Provider adapters. Everything is normalized to `Msg` / `Turn`, so the agent
 //! loop never cares which vendor is on the other end.
-use crate::config::{Config, Provider};
+use crate::config::{Config, Wire};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The community model catalog (models.dev) that opencode and pi derive their
@@ -203,18 +203,16 @@ impl Client {
         context: &str,
         mut on_chunk: impl FnMut(Chunk<'_>),
     ) -> Result<Turn> {
-        if cfg.api_key.is_empty() {
+        if cfg.api_key.is_empty() && cfg.provider.requires_key() {
             bail!(
                 "no API key for {}: set {} or run /provider",
                 cfg.provider.name(),
                 cfg.provider.key_env()
             );
         }
-        let (url, body, headers) = match cfg.provider {
-            Provider::Anthropic => anthropic_request(cfg, history, tools, context),
-            Provider::Openai | Provider::Tokenharbor | Provider::Openrouter => {
-                openai_request(cfg, history, tools, context)
-            }
+        let (url, body, headers) = match cfg.provider.wire() {
+            Wire::Anthropic => anthropic_request(cfg, history, tools, context),
+            Wire::OpenAi => openai_request(cfg, history, tools, context),
         };
         let started = Instant::now();
         let mut first: Option<Instant> = None;
@@ -225,11 +223,9 @@ impl Client {
             on_chunk(c);
         };
         let mut resp = send_with_retry(&self.http, &url, &body, &headers)?;
-        let turn = match cfg.provider {
-            Provider::Anthropic => stream_anthropic(&mut resp, &mut timed),
-            Provider::Openai | Provider::Tokenharbor | Provider::Openrouter => {
-                stream_openai(&mut resp, &mut timed)
-            }
+        let turn = match cfg.provider.wire() {
+            Wire::Anthropic => stream_anthropic(&mut resp, &mut timed),
+            Wire::OpenAi => stream_openai(&mut resp, &mut timed),
         };
         // Time to first token is where the wait is felt; the rest is generation
         // speed. A failed call records nothing: `/stats` is billing, not errors.
@@ -246,11 +242,11 @@ impl Client {
     /// surfaced so a silent empty menu is never mistaken for the truth.
     pub fn fetch_models(&self, base_url: &str, api_key: &str) -> Result<ModelList> {
         let url = format!("{base_url}/models");
-        let v: Value = self
-            .http
-            .get(&url)
-            .bearer_auth(api_key)
-            .timeout(Duration::from_secs(8))
+        let mut req = self.http.get(&url).timeout(Duration::from_secs(8));
+        if !api_key.is_empty() {
+            req = req.bearer_auth(api_key);
+        }
+        let v: Value = req
             .send()
             .with_context(|| format!("reaching {url}"))?
             .error_for_status()
@@ -747,7 +743,15 @@ fn anthropic_request(
             ("x-api-key", cfg.api_key.clone()),
             ("anthropic-version", "2023-06-01".to_string()),
         ];
-        (format!("{}/v1/messages", cfg.base_url), body, headers)
+        // A third-party Anthropic-compatible endpoint may already end in /v1
+        // (the OpenAI convention); adding another would double it.
+        let base = cfg.base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+        (url, body, headers)
     }
 
 fn openai_request(
@@ -796,14 +800,17 @@ fn openai_request(
         if let Some(effort) = api_effort(&cfg.thinking) {
             body["reasoning_effort"] = json!(effort);
         }
-        let headers = match cfg.provider {
-            // OpenRouter honors these optional headers for attribution/rate limits.
-            Provider::Openrouter => vec![
+        // OpenRouter honors these optional headers for attribution/rate limits.
+        // A keyless custom endpoint gets no Authorization header at all: an
+        // empty `Bearer ` is a 401 on most local servers, not "no auth".
+        let headers = match (cfg.api_key.is_empty(), cfg.provider.name()) {
+            (true, _) => Vec::new(),
+            (false, "openrouter") => vec![
                 ("authorization", format!("Bearer {}", cfg.api_key)),
                 ("HTTP-Referer", "https://github.com/rift-shell".to_string()),
                 ("X-Title", "rift".to_string()),
             ],
-            _ => vec![("authorization", format!("Bearer {}", cfg.api_key))],
+            (false, _) => vec![("authorization", format!("Bearer {}", cfg.api_key))],
         };
         (format!("{}/chat/completions", cfg.base_url), body, headers)
     }
@@ -820,6 +827,12 @@ fn openai_request(
 pub fn context_window_for(store: Option<&crate::store::Store>, provider: &str, model: &str) -> u64 {
     if let Some(store) = store {
         if let Some(ctx) = store.context_of(provider, model) {
+            return ctx;
+        }
+        // The shared models.dev table is keyed by bare model id. It is the
+        // fallback for every provider whose own `/models` list carries no
+        // context annotation (OpenAI, local endpoints, custom gateways).
+        if let Some(ctx) = store.context_of("models.dev", model) {
             return ctx;
         }
     }
@@ -993,9 +1006,170 @@ fn truncate_err(s: &str) -> String {
     s.chars().take(500).collect()
 }
 
+/// A provider declared in `providers.json`. Its shape matches a stored row so
+/// the rest of the app does not care where a provider came from.
+#[derive(Clone)]
+pub struct FileProvider {
+    pub name: String,
+    pub state: crate::store::ProviderState,
+    pub models: Vec<String>,
+}
+
+fn text_field<'a>(
+    spec: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| spec.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Model ids from either an array of strings/objects or an object keyed by id.
+fn models_from(v: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match v {
+        Some(Value::Array(items)) => {
+            for item in items {
+                let id = match item {
+                    Value::String(s) => s.trim().to_string(),
+                    Value::Object(map) => text_field(map, &["id", "model", "name"])
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                if !id.is_empty() && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        Some(Value::Object(map)) => {
+            for id in map.keys() {
+                let id = id.trim();
+                if !id.is_empty() && !out.iter().any(|m| m == id) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Parse the provider file. One object maps each provider name to its settings,
+/// optionally wrapped in `{"providers": ...}`. Entries that cannot be used (no
+/// URL, unknown wire, bad name) are skipped, so one typo never hides the rest.
+pub(crate) fn parse_providers(text: &str) -> Result<Vec<FileProvider>, String> {
+    let root: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let map = root
+        .get("providers")
+        .and_then(Value::as_object)
+        .or_else(|| root.as_object())
+        .ok_or_else(|| "expected a JSON object of providers".to_string())?;
+    let mut out = Vec::new();
+    for (name, spec) in map {
+        let name = name.trim().to_ascii_lowercase();
+        if !crate::config::valid_custom_name(&name)
+            && crate::config::Provider::builtin(&name).is_none()
+        {
+            continue;
+        }
+        let Some(spec) = spec.as_object() else { continue };
+        let wire = if spec.contains_key("type") || spec.contains_key("wire") {
+            match text_field(spec, &["type", "wire"]).and_then(Wire::parse) {
+                Some(w) => w,
+                None => continue,
+            }
+        } else {
+            Wire::OpenAi
+        };
+        let url = text_field(spec, &["url", "base_url", "baseURL", "baseUrl"])
+            .map(crate::config::normalize_url)
+            .or_else(|| crate::config::local_default_url(&name).map(str::to_string));
+        let Some(url) = url else { continue };
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
+        }
+        let models = models_from(spec.get("models"));
+        let model = text_field(spec, &["model"])
+            .map(str::to_string)
+            .or_else(|| models.first().cloned())
+            .unwrap_or_default();
+        let key = text_field(spec, &["api_key", "apiKey"])
+            .map(str::to_string)
+            .or_else(|| {
+                text_field(spec, &["api_key_env", "apiKeyEnv"])
+                    .and_then(|env| std::env::var(env).ok())
+            })
+            .unwrap_or_default();
+        out.push(FileProvider {
+            name,
+            state: crate::store::ProviderState {
+                model,
+                base_url: url,
+                api_key: key,
+                kind: wire.as_str().to_string(),
+            },
+            models,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Every provider the file declares. Read on every call so an edit is picked
+/// up by the next `/provider`; a malformed file is treated as empty and the
+/// startup check reports it.
+pub fn file_providers() -> Vec<FileProvider> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(crate::config::providers_path()) else {
+        return Vec::new();
+    };
+    parse_providers(&text).unwrap_or_default()
+}
+
+pub fn file_provider(name: &str) -> Option<FileProvider> {
+    let name = name.trim().to_ascii_lowercase();
+    file_providers().into_iter().find(|p| p.name == name)
+}
+
+/// A provider's connection details: the file wins over a stored row, so
+/// editing the file is always authoritative.
+pub fn state(
+    name: &str,
+    store: &crate::store::Store,
+) -> Option<crate::store::ProviderState> {
+    file_provider(name)
+        .map(|p| p.state)
+        .or_else(|| store.provider_state(name))
+}
+
+pub fn is_file_backed(name: &str) -> bool {
+    file_provider(name).is_some()
+}
+
+/// A startup check for a broken file: `None` when absent or valid.
+pub fn file_problem() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let path = crate::config::providers_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{}: {e}", path.display())),
+    };
+    parse_providers(&text)
+        .err()
+        .map(|e| format!("{}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Provider;
 
     #[test]
     fn the_context_window_guess_errs_low_for_unknown_models() {
@@ -1122,7 +1296,7 @@ mod tests {
         // Parallel commands share a wait, never a result: the model must get
         // one block per call, with the body that call produced, so a batch
         // costs it nothing in information compared with running in sequence.
-        let cfg = test_cfg(Provider::Anthropic);
+        let cfg = test_cfg(Provider::builtin("anthropic").unwrap());
         let hist = vec![
             Msg::User("three things".into()),
             Msg::Assistant {
@@ -1156,7 +1330,7 @@ mod tests {
 
     #[test]
     fn anthropic_request_includes_thinking_budget() {
-        let mut cfg = test_cfg(Provider::Anthropic);
+        let mut cfg = test_cfg(Provider::builtin("anthropic").unwrap());
         let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
         assert_eq!(body["thinking"]["budget_tokens"], 10240);
         cfg.thinking = "off".into();
@@ -1166,13 +1340,42 @@ mod tests {
 
     #[test]
     fn openai_request_passes_effort_through() {
-        let cfg = test_cfg(Provider::Openai);
+        let cfg = test_cfg(Provider::builtin("openai").unwrap());
         let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
         assert_eq!(body["reasoning_effort"], "medium");
-        let mut cfg = test_cfg(Provider::Tokenharbor);
+        let mut cfg = test_cfg(Provider::builtin("tokenharbor").unwrap());
         cfg.thinking = "off".into();
         let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_custom_provider_uses_its_url_and_skips_auth_without_a_key() {
+        let mut cfg = test_cfg(Provider::custom("ollama", crate::config::Wire::OpenAi));
+        cfg.base_url = "http://localhost:11434/v1".into();
+        cfg.api_key = String::new();
+        let (url, _, headers) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(url, "http://localhost:11434/v1/chat/completions");
+        assert!(
+            headers.is_empty(),
+            "a keyless local endpoint must not send an empty bearer header"
+        );
+    }
+
+    #[test]
+    fn a_custom_provider_can_speak_the_anthropic_shape() {
+        let cfg = test_cfg(Provider::custom("claude-proxy", crate::config::Wire::Anthropic));
+        let (url, _, headers) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert!(url.ends_with("/v1/messages"), "{url}");
+        assert_eq!(headers[0].0, "x-api-key");
+    }
+
+    #[test]
+    fn an_anthropic_proxy_url_that_already_ends_in_v1_is_not_doubled() {
+        let mut cfg = test_cfg(Provider::custom("claude-proxy", crate::config::Wire::Anthropic));
+        cfg.base_url = "https://proxy.example/v1".into();
+        let (url, _, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(url, "https://proxy.example/v1/messages");
     }
 
     #[test]
@@ -1366,6 +1569,30 @@ mod catalog_tests {
     }
 
     #[test]
+    fn the_shared_models_dev_table_is_a_fallback_for_every_provider() {
+        let store = crate::store::Store::memory();
+        store.save_contexts(
+            "models.dev",
+            &[("claude-sonnet-4-5".to_string(), 123_456)],
+        );
+        // A custom endpoint and an OpenRouter id both read the shared table.
+        assert_eq!(
+            context_window_for(Some(&store), "local-proxy", "claude-sonnet-4-5"),
+            123_456
+        );
+        assert_eq!(
+            context_window_for(Some(&store), "openrouter", "anthropic/claude-sonnet-4-5"),
+            123_456
+        );
+        // A provider-specific figure still wins over the shared one.
+        store.save_contexts("local-proxy", &[("claude-sonnet-4-5".to_string(), 200_000)]);
+        assert_eq!(
+            context_window_for(Some(&store), "local-proxy", "claude-sonnet-4-5"),
+            200_000
+        );
+    }
+
+    #[test]
     fn an_exact_context_beats_the_substring_guess() {
         let store = crate::store::Store::memory();
         // The guess alone would say 200_000 for this id.
@@ -1378,6 +1605,57 @@ mod catalog_tests {
         // Nothing learned: the guess applies unchanged.
         assert_eq!(context_window_for(Some(&store), "anthropic", "claude-haiku-4.5"), 200_000);
         assert_eq!(context_window_for(None, "anthropic", "claude-sonnet-4-5"), 200_000);
+    }
+
+    #[test]
+    fn the_provider_file_accepts_a_bare_map_and_a_wrapper() {
+        let bare = r#"{"lfm":{"url":"http://127.0.0.1:8787/v1","model":"lfm2.5-vl-3b"}}"#;
+        let p = parse_providers(bare).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name, "lfm");
+        assert_eq!(p[0].state.model, "lfm2.5-vl-3b");
+        assert_eq!(p[0].state.base_url, "http://127.0.0.1:8787/v1");
+        assert_eq!(p[0].state.kind, "openai", "openai-compatible is the default");
+        assert!(p[0].state.api_key.is_empty(), "local servers need no key");
+
+        let wrapped = r#"{"providers":{"proxy":{
+            "type":"anthropic","base_url":"https://proxy.example/v1",
+            "models":["claude-a","claude-b"]
+        }}}"#;
+        let p = parse_providers(wrapped).unwrap();
+        assert_eq!(p[0].state.kind, "anthropic");
+        assert_eq!(p[0].models, vec!["claude-a", "claude-b"]);
+        // One model declared and no `model`: it becomes the default.
+        assert_eq!(p[0].state.model, "claude-a");
+    }
+
+    #[test]
+    fn the_provider_file_reads_models_in_both_common_shapes() {
+        let array = r#"{"x":{"url":"http://localhost:1/v1",
+            "models":["a",{"id":"b"},{"name":"c"}]}}"#;
+        assert_eq!(parse_providers(array).unwrap()[0].models, vec!["a", "b", "c"]);
+        let object = r#"{"x":{"url":"http://localhost:1/v1",
+            "models":{"a":{},"b":{"name":"B"}}}}"#;
+        assert_eq!(parse_providers(object).unwrap()[0].models, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_broken_entry_does_not_hide_the_rest_of_the_file() {
+        let text = r#"{
+            "good": {"url":"http://localhost:1/v1","models":["a","b"]},
+            "no-url": {"model":"x"},
+            "bad-wire": {"url":"http://localhost:2/v1","type":"smoke-signals"},
+            "not a name!": {"url":"http://localhost:3/v1"}
+        }"#;
+        let p = parse_providers(text).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name, "good");
+    }
+
+    #[test]
+    fn a_conventional_local_name_can_omit_its_url() {
+        let p = parse_providers(r#"{"ollama":{"model":"llama3.2"}}"#).unwrap();
+        assert_eq!(p[0].state.base_url, "http://localhost:11434/v1");
     }
 }
 

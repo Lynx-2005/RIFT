@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use std::path::PathBuf;
 
 /// The user's home directory. `HOME` covers Unix; Windows uses `USERPROFILE`,
@@ -20,55 +20,228 @@ pub fn home_dir() -> Option<PathBuf> {
     Some(PathBuf::from(format!("{drive}{path}")))
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Provider {
+/// Where per-user configuration lives: `~/.config/rift` on Unix,
+/// `%APPDATA%\rift` on Windows. `RIFT_CONFIG_DIR` overrides it.
+pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("RIFT_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(dir) = std::env::var("APPDATA") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("rift");
+        }
+    }
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("rift");
+        }
+    }
+    home_dir()
+        .map(|h| h.join(".config").join("rift"))
+        .unwrap_or_else(|| PathBuf::from(".rift"))
+}
+
+/// The global RIFT directory, `~/.rift`. The project's `.rift` is its
+/// per-project twin; this one holds settings that apply everywhere.
+pub fn dot_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".rift"))
+}
+
+/// The provider file: a small JSON map read on every lookup, so editing it
+/// takes effect without a restart. `RIFT_PROVIDERS` points somewhere else.
+/// `~/.rift/providers.json` wins when it exists; the XDG location stays as a
+/// fallback for existing installs.
+pub fn providers_path() -> PathBuf {
+    if let Ok(path) = std::env::var("RIFT_PROVIDERS") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("RIFT_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("providers.json");
+        }
+    }
+    if let Some(dot) = dot_dir() {
+        let path = dot.join("providers.json");
+        if path.exists() {
+            return path;
+        }
+    }
+    config_dir().join("providers.json")
+}
+
+/// How a provider's HTTP API is shaped. Both are normalized to one `Turn`, so
+/// this is the only thing the request builders branch on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Wire {
     Anthropic,
-    Openai,
-    Tokenharbor,
-    Openrouter,
+    OpenAi,
+}
+
+impl Wire {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Some(Wire::Anthropic),
+            "openai" | "openai-compatible" | "openai_compatible" => Some(Wire::OpenAi),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Wire::Anthropic => "anthropic",
+            Wire::OpenAi => "openai",
+        }
+    }
+}
+
+/// A provider is an id plus the wire shape behind it. The four built-ins carry
+/// their own defaults; everything else is a custom endpoint the user saved.
+/// Custom providers are first-class: they appear in `/provider`, their models
+/// join the same `/model` catalog, and they persist like the built-ins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provider {
+    name: String,
+    wire: Wire,
+    builtin: bool,
 }
 
 impl Provider {
-    pub fn name(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "anthropic",
-            Provider::Openai => "openai",
-            Provider::Tokenharbor => "tokenharbor",
-            Provider::Openrouter => "openrouter",
-        }
+    /// One of the four providers with defaults baked in.
+    pub fn builtin(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        let wire = match name.as_str() {
+            "anthropic" => Wire::Anthropic,
+            "openai" | "tokenharbor" | "openrouter" => Wire::OpenAi,
+            _ => return None,
+        };
+        Some(Self { name, wire, builtin: true })
     }
 
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "claude-sonnet-4-5",
-            Provider::Openai => "gpt-4.1",
-            Provider::Tokenharbor => "claude-sonnet-4.6",
+    /// A user-defined endpoint. The name must already be a valid slug.
+    pub fn custom(name: &str, wire: Wire) -> Self {
+        Self { name: name.to_ascii_lowercase(), wire, builtin: false }
+    }
+
+    /// The provider a stored row describes, or a built-in by name.
+    pub fn from_state(name: &str, kind: &str) -> Option<Self> {
+        if let Some(p) = Self::builtin(name) {
+            return Some(p);
+        }
+        // Rows written before custom providers stored a wire kind can only
+        // have come from an OpenAI-compatible endpoint. Recover them instead
+        // of hiding a provider (and a cached model list) the user already has;
+        // `/provider add <name> url=... type=anthropic` fixes the rare miss.
+        let wire = if kind.trim().is_empty() {
+            Wire::OpenAi
+        } else {
+            Wire::parse(kind)?
+        };
+        Some(Self::custom(name, wire))
+    }
+
+    /// Resolve a name against the built-ins, the provider file, and the
+    /// custom providers saved in the database.
+    pub fn resolve(name: &str, store: &crate::store::Store) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        if let Some(p) = Self::builtin(&name) {
+            return Some(p);
+        }
+        let kind = crate::provider::file_provider(&name)
+            .map(|p| p.state.kind)
+            .or_else(|| store.provider_state(&name).map(|s| s.kind))?;
+        Self::from_state(&name, &kind)
+    }
+
+    /// Aliases kept for call sites that mean "the built-in".
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::builtin(name)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    pub fn is_custom(&self) -> bool {
+        !self.builtin
+    }
+
+    pub fn default_model(&self) -> &'static str {
+        match self.name.as_str() {
+            "anthropic" => "claude-sonnet-4-5",
+            "openai" => "gpt-4.1",
+            "tokenharbor" => "claude-sonnet-4.6",
             // ponytail: fixed default, use /model for the full catalog
-            Provider::Openrouter => "openai/gpt-4.1",
+            "openrouter" => "openai/gpt-4.1",
+            // A custom endpoint names its own model; there is no honest guess.
+            _ => "",
         }
     }
 
-    pub fn default_url(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "https://api.anthropic.com",
-            Provider::Openai => "https://api.openai.com/v1",
-            Provider::Tokenharbor => "https://tokenharbor.ai/v1",
-            Provider::Openrouter => "https://openrouter.ai/api/v1",
+    pub fn default_url(&self) -> &'static str {
+        match self.name.as_str() {
+            "anthropic" => "https://api.anthropic.com",
+            "openai" => "https://api.openai.com/v1",
+            "tokenharbor" => "https://tokenharbor.ai/v1",
+            "openrouter" => "https://openrouter.ai/api/v1",
+            _ => "",
         }
     }
 
-    pub fn key_env(self) -> &'static str {
-        match self {
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::Openai => "OPENAI_API_KEY",
-            Provider::Tokenharbor => "TOKENHARBOR_API_KEY",
-            Provider::Openrouter => "OPENROUTER_API_KEY",
+    /// The environment variable that can supply this provider's key. Custom
+    /// names derive one (`RIFT_MY_SERVER_API_KEY`), so a local endpoint can be
+    /// configured without storing a secret at all.
+    pub fn key_env(&self) -> String {
+        match self.name.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY".to_string(),
+            "openai" => "OPENAI_API_KEY".to_string(),
+            "tokenharbor" => "TOKENHARBOR_API_KEY".to_string(),
+            "openrouter" => "OPENROUTER_API_KEY".to_string(),
+            other => format!(
+                "RIFT_{}_API_KEY",
+                other.to_ascii_uppercase().replace(['-', '.'], "_")
+            ),
         }
     }
 
     /// Reads this provider's key from the environment, if set.
-    pub fn env_key(self) -> Option<String> {
+    pub fn env_key(&self) -> Option<String> {
         std::env::var(self.key_env()).ok().filter(|k| !k.is_empty())
+    }
+
+    /// Local and third-party endpoints often take no key. Built-ins always do.
+    pub fn requires_key(&self) -> bool {
+        self.builtin
+    }
+}
+
+/// Names allowed for a custom provider: a short slug, so it is safe to type,
+/// safe as an env var, and safe as a database key.
+pub fn valid_custom_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    first.is_ascii_alphanumeric()
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The conventional OpenAI-compatible URL for well-known local servers, so
+/// `/provider add ollama model=llama3.2` works without spelling the URL out.
+pub fn local_default_url(name: &str) -> Option<&'static str> {
+    match name {
+        "ollama" => Some("http://localhost:11434/v1"),
+        "lmstudio" | "lm-studio" => Some("http://localhost:1234/v1"),
+        "llamacpp" | "llama-cpp" => Some("http://localhost:8080/v1"),
+        "vllm" => Some("http://localhost:8000/v1"),
+        _ => None,
     }
 }
 
@@ -79,9 +252,10 @@ pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"
 #[derive(Parser, Debug)]
 #[command(name = "rift", version, about = "One tool to rule them all: the shell")]
 pub struct Cli {
-    /// Model provider.
-    #[arg(long, env = "SH_PROVIDER", value_enum, default_value = "anthropic")]
-    pub provider: Provider,
+    /// Provider id: anthropic, openai, tokenharbor, openrouter, or a custom one
+    /// added with `/provider add`.
+    #[arg(long, env = "SH_PROVIDER", default_value = "anthropic")]
+    pub provider: String,
 
     /// Model name. Defaults depend on provider.
     #[arg(long, short, env = "SH_MODEL")]
@@ -195,6 +369,40 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_custom_provider_is_a_first_class_cli_target() {
+        let store = crate::store::Store::memory();
+        store.save_custom_provider(
+            "ollama",
+            "openai",
+            "llama3.2",
+            "http://localhost:11434/v1",
+            "",
+        );
+        let cfg = build(&["rift", "--provider", "ollama"], &store).unwrap();
+        assert_eq!(cfg.provider, Provider::custom("ollama", Wire::OpenAi));
+        assert_eq!(cfg.model, "llama3.2");
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert!(cfg.api_key.is_empty(), "custom endpoints may be keyless");
+        assert!(!cfg.provider.requires_key());
+        // A custom name nobody saved is a startup error that says how to fix it.
+        let err = build(&["rift", "--provider", "nope"], &store).unwrap_err().to_string();
+        assert!(err.contains("unknown provider 'nope'"), "{err}");
+        assert!(err.contains("/provider add"), "{err}");
+    }
+
+    #[test]
+    fn a_custom_provider_restores_its_stored_key_and_model() {
+        let store = crate::store::Store::memory();
+        store.save_custom_provider("proxy", "anthropic", "claude-x", "https://proxy/v1", "k1");
+        let mut cfg = Config::for_test();
+        cfg.switch_provider(&Provider::custom("proxy", Wire::Anthropic), &store).unwrap();
+        assert_eq!(cfg.model, "claude-x");
+        assert_eq!(cfg.base_url, "https://proxy/v1");
+        assert_eq!(cfg.api_key, "k1");
+        assert_eq!(cfg.provider.wire(), Wire::Anthropic);
+    }
+
+    #[test]
     fn an_unknown_thinking_level_is_rejected_with_the_list() {
         let store = crate::store::Store::memory();
         let err = build(
@@ -208,24 +416,12 @@ mod tests {
     }
 }
 
-impl Provider {
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "anthropic" => Some(Provider::Anthropic),
-            "openai" => Some(Provider::Openai),
-            "tokenharbor" => Some(Provider::Tokenharbor),
-            "openrouter" => Some(Provider::Openrouter),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 impl Config {
     /// A minimal config for tests that need a request body and nothing else.
     pub fn for_test() -> Self {
         Config {
-            provider: Provider::Openai,
+            provider: Provider::builtin("openai").unwrap(),
             model: "mock-1".into(),
             base_url: "http://localhost/v1".into(),
             api_key: "k".into(),
@@ -257,15 +453,21 @@ impl Config {
             cli.base_url.is_some(),
             cli.api_key.is_some(),
         );
-        let provider = if provider_explicit {
-            cli.provider
+        let provider_name = if provider_explicit {
+            cli.provider.trim().to_string()
         } else {
             store
                 .active_provider()
-                .and_then(|n| Provider::parse(&n))
-                .unwrap_or(cli.provider)
+                .unwrap_or_else(|| cli.provider.trim().to_string())
         };
-        let saved = store.provider_state(provider.name());
+        let Some(provider) = Provider::resolve(&provider_name, store) else {
+            anyhow::bail!(
+                "unknown provider '{provider_name}'. Built-in: {}. Add a custom one with \
+                 /provider add <name> url=<url>",
+                crate::commands::PROVIDERS.join(", ")
+            );
+        };
+        let saved = crate::provider::state(provider.name(), store);
         // A missing key is not fatal at startup. It is reported when a request is made.
         let api_key = cli
             .api_key
@@ -293,17 +495,19 @@ impl Config {
                 .get_thinking(provider.name())
                 .unwrap_or_else(|| "medium".to_string()),
         };
+        let model = cli
+            .model
+            .or_else(|| saved.as_ref().map(|s| s.model.clone()).filter(|m| !m.is_empty()))
+            .unwrap_or_else(|| provider.default_model().to_string());
+        let base_url = normalize_url(
+            &cli.base_url
+                .or_else(|| saved.as_ref().map(|s| s.base_url.clone()).filter(|u| !u.is_empty()))
+                .unwrap_or_else(|| provider.default_url().to_string()),
+        );
         Ok(Self {
             provider,
-            model: cli
-                .model
-                .or_else(|| saved.as_ref().map(|s| s.model.clone()))
-                .unwrap_or_else(|| provider.default_model().to_string()),
-            base_url: normalize_url(
-                &cli.base_url
-                    .or_else(|| saved.as_ref().map(|s| s.base_url.clone()))
-                    .unwrap_or_else(|| provider.default_url().to_string()),
-            ),
+            model,
+            base_url,
             api_key,
             thinking,
             timeout: std::time::Duration::from_secs(cli.timeout),
@@ -335,17 +539,22 @@ pub fn normalize_url(url: &str) -> String {
 impl Config {
     /// Switches provider, restoring its stored model/URL/key when present
     /// (env key wins), else that provider's defaults.
-    pub fn switch_provider(&mut self, provider: Provider, store: &crate::store::Store) -> Result<()> {
-        let saved = store.provider_state(provider.name());
-        self.provider = provider;
+    pub fn switch_provider(
+        &mut self,
+        provider: &Provider,
+        store: &crate::store::Store,
+    ) -> Result<()> {
+        let saved = crate::provider::state(provider.name(), store);
         self.model = saved
             .as_ref()
             .map(|s| s.model.clone())
+            .filter(|m| !m.is_empty())
             .unwrap_or_else(|| provider.default_model().to_string());
         self.base_url = normalize_url(
             &saved
                 .as_ref()
                 .map(|s| s.base_url.clone())
+                .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| provider.default_url().to_string()),
         );
         self.api_key = provider
@@ -355,6 +564,7 @@ impl Config {
         self.thinking = store
             .get_thinking(provider.name())
             .unwrap_or_else(|| "medium".to_string());
+        self.provider = provider.clone();
         Ok(())
     }
 }

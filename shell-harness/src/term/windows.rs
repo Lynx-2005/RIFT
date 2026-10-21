@@ -92,38 +92,6 @@ impl Drop for RawGuard {
     }
 }
 
-/// Echo off while a secret (API key) is typed. `None` when stdin is not a
-/// console, so the caller knows not to expect a swallowed newline.
-pub struct EchoGuard {
-    old: (HANDLE, CONSOLE_MODE),
-}
-
-impl EchoGuard {
-    pub fn new() -> Option<Self> {
-        if !super::is_tty() {
-            return None;
-        }
-        unsafe {
-            let h = handle(STD_INPUT_HANDLE);
-            let mut mode: CONSOLE_MODE = 0;
-            if GetConsoleMode(h, &mut mode) == 0 {
-                return None;
-            }
-            SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT);
-            Some(EchoGuard { old: (h, mode) })
-        }
-    }
-}
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        let (h, old) = self.old;
-        unsafe {
-            SetConsoleMode(h, old);
-        }
-    }
-}
-
 /// The last window size `took_resize` saw. No signal exists to tell us the
 /// window changed, so the size itself is the signal.
 static LAST_SIZE: AtomicU64 = AtomicU64::new(u64::MAX);

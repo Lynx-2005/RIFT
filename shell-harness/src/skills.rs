@@ -20,9 +20,10 @@ pub struct Skill {
 }
 
 /// Where skills are looked for, in precedence order (earlier wins): the
-/// project's own, then the user's rift directory, then `~/.claude/skills` so a
-/// collection already written for another harness is not stranded.
-/// `RIFT_SKILLS_DIR` replaces the list entirely, which is what tests use.
+/// project's own, then `~/.rift/skills`, then the XDG location, then
+/// `~/.claude/skills` so a collection already written for another harness is
+/// not stranded. `RIFT_SKILLS_DIR` replaces the list entirely, which is what
+/// tests use.
 fn search_dirs(cwd: &Path) -> Vec<PathBuf> {
     if let Ok(list) = std::env::var("RIFT_SKILLS_DIR") {
         return std::env::split_paths(&list)
@@ -30,9 +31,17 @@ fn search_dirs(cwd: &Path) -> Vec<PathBuf> {
             .collect();
     }
     let mut dirs = vec![cwd.join(".rift").join("skills")];
+    let mut push = |p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    if let Some(dot) = crate::config::dot_dir() {
+        push(dot.join("skills"));
+    }
+    push(crate::config::config_dir().join("skills"));
     if let Some(home) = crate::config::home_dir() {
-        dirs.push(home.join(".config").join("rift").join("skills"));
-        dirs.push(home.join(".claude").join("skills"));
+        push(home.join(".claude").join("skills"));
     }
     dirs
 }

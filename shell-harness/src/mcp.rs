@@ -407,9 +407,17 @@ pub fn config_paths(cwd: &Path) -> Vec<PathBuf> {
             .collect();
     }
     let mut paths = vec![cwd.join(".rift").join("mcp.json"), cwd.join(".mcp.json")];
+    let mut push = |p: PathBuf| {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    };
+    if let Some(dot) = crate::config::dot_dir() {
+        push(dot.join("mcp.json"));
+    }
+    push(crate::config::config_dir().join("mcp.json"));
     if let Some(home) = crate::config::home_dir() {
-        paths.push(home.join(".config").join("rift").join("mcp.json"));
-        paths.push(home.join(".claude.json"));
+        push(home.join(".claude.json"));
     }
     paths
 }

@@ -1,5 +1,7 @@
 //! Slash commands typed at the `>` prompt. They change the session, not the files on disk.
-use crate::config::{normalize_url, Config, Provider};
+use crate::config::{
+    local_default_url, normalize_url, valid_custom_name, Config, Provider, Wire,
+};
 
 pub enum Action {
     /// Not a slash command: send to the model.
@@ -14,11 +16,13 @@ pub enum Action {
     /// Change configuration (already applied to `cfg`); message to print.
     Changed(String),
     /// Provider switched but has no key: the loop prompts for one inline.
-    NeedKey { msg: String, env: &'static str },
+    NeedKey { msg: String, env: String },
     /// Leave the REPL.
     Exit,
     /// Bare `/model`: the loop refreshes catalogs, then opens the live picker.
     Models,
+    /// Bare `/provider`: open the provider picker (built-in + custom).
+    Providers,
     /// Show or set the thinking effort level (already validated by agent).
     Thinking(String),
     /// Summarize history into one line of context. Arg = extra instructions.
@@ -46,8 +50,8 @@ pub enum Action {
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show this list"),
     ("/status", "show provider, model, thinking and key status"),
-    ("/provider", "show or switch provider (key=/url= inline)"),
-    ("/model", "show or set the model for this session"),
+    ("/provider", "pick or configure a provider (/provider add for a custom one)"),
+    ("/model", "pick from every configured provider, or set one id"),
     ("/thinking", "show or set thinking effort (off|minimal|low|medium|high|xhigh|max)"),
     ("/compact", "summarize history to free context"),
     ("/autocompact", "compact automatically at N% of the context window (/autocompact 80, off)"),
@@ -92,35 +96,121 @@ pub fn model_candidates(
         .collect()
 }
 
-/// Every provider with a key (env wins, else stored), each with its cached
-/// catalog or the static fallback. This is what `/model` lists and searches.
+/// Every provider the user can select: the four built-ins plus every custom
+/// endpoint saved on disk. Custom rows carry their wire shape, so this is the
+/// one list every provider command and the picker share.
+pub fn known_providers(store: &crate::store::Store) -> Vec<Provider> {
+    let mut out: Vec<Provider> = PROVIDERS.iter().filter_map(|n| Provider::parse(n)).collect();
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|p| p.name().to_string()).collect();
+    for fp in crate::provider::file_providers() {
+        if seen.insert(fp.name.clone()) {
+            if let Some(p) = Provider::from_state(&fp.name, &fp.state.kind) {
+                out.push(p);
+            }
+        }
+    }
+    for (name, state) in store.provider_rows() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(p) = Provider::from_state(&name, &state.kind) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The key that would be used for this provider right now: environment first,
+/// then the stored row. `None` means no key is set (which is fine for custom
+/// endpoints and fatal for built-ins).
+pub fn provider_key(p: &Provider, store: &crate::store::Store) -> Option<String> {
+    p.env_key()
+        .or_else(|| {
+            crate::provider::state(p.name(), store)
+                .map(|s| s.api_key)
+                .filter(|k| !k.is_empty())
+        })
+}
+
+/// Picker rows for `/provider`: every known provider, with whether it is
+/// current, custom, and ready to use.
+pub fn provider_candidates(store: &crate::store::Store, active: &str) -> Vec<(String, String)> {
+    known_providers(store)
+        .into_iter()
+        .map(|p| {
+            let keyed = provider_key(&p, store).is_some();
+            let mut desc = if p.is_custom() {
+                format!("custom {} API", p.wire().as_str())
+            } else {
+                "built-in".to_string()
+            };
+            if p.name() == active {
+                desc = format!("current, {desc}");
+            }
+            if keyed {
+                desc.push_str(", key set");
+            } else if p.is_custom() {
+                desc.push_str(", no key needed");
+            } else {
+                desc.push_str(", no key");
+            }
+            (p.name().to_string(), desc)
+        })
+        .collect()
+}
+
+/// Every configured provider's cached catalog, or the static fallback for
+/// Anthropic. This is what `/model` lists and searches: models from all
+/// connected providers show up together, and picking one switches to its
+/// owner.
 pub fn connected_catalog(store: &crate::store::Store) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for name in PROVIDERS {
-        let Some(p) = Provider::parse(name) else { continue };
-        let key = std::env::var(p.key_env())
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| store.provider_state(name).map(|s| s.api_key))
-            .unwrap_or_default();
-        if key.is_empty() {
+    let files = crate::provider::file_providers();
+    let file_names: std::collections::HashSet<&str> =
+        files.iter().map(|f| f.name.as_str()).collect();
+    // The same id can be listed by several providers (a local server is often
+    // also in a stale built-in row). Show it once, owned by the provider file
+    // entry, which is the one the user actually wrote down.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for p in known_providers(store) {
+        let name = p.name();
+        let usable = !p.requires_key() || provider_key(&p, store).is_some();
+        if !usable {
             continue;
         }
         // The live catalog or nothing: a provider whose list has never been
         // fetched (or whose fetch keeps failing) shows no guesses, so a short
         // menu is always a fact about the connection, never a fake default.
         // Anthropic is the exception: it has no list API, so its static
-        // catalog is the real one.
-        if let Some((ids, _)) = store.cached_models(name) {
-            for id in ids {
-                if !id.is_empty() {
-                    out.push((name.to_string(), id));
+        // catalog is the real one. A file provider may declare its models, and
+        // a custom one may carry a hand-written list from `/provider add`.
+        let declared = files
+            .iter()
+            .find(|f| f.name == *name)
+            .map(|f| f.models.clone())
+            .unwrap_or_default();
+        let cached = store.cached_models(name).map(|(ids, _)| ids).unwrap_or_default();
+        let mut ids: Vec<String> = Vec::new();
+        for id in declared.into_iter().chain(cached) {
+            if !id.is_empty() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() && name == "anthropic" {
+            ids.extend(ANTHROPIC_MODELS.iter().map(|s| s.to_string()));
+        }
+        for id in ids {
+            if let Some(&i) = seen.get(&id) {
+                if file_names.contains(name)
+                    && !file_names.contains(out[i].0.as_str())
+                {
+                    out[i] = (name.to_string(), id);
                 }
+                continue;
             }
-        } else if *name == "anthropic" {
-            for id in ANTHROPIC_MODELS {
-                out.push((name.to_string(), id.to_string()));
-            }
+            seen.insert(id.clone(), out.len());
+            out.push((name.to_string(), id));
         }
     }
     out
@@ -198,7 +288,7 @@ pub fn handle(line: &str, cfg: &mut Config, store: &crate::store::Store) -> Acti
         "/reset" => Action::Reset("history cleared".into()),
         "/status" => Action::Message(status(cfg)),
         "/provider" => provider(arg, cfg, store),
-        "/model" => model(arg, cfg, store),
+        "/model" | "/models" => model(arg, cfg, store),
         "/thinking" => Action::Thinking(arg.to_string()),
         "/compact" => Action::Compact(arg.to_string()),
         "/btw" => {
@@ -251,7 +341,12 @@ pub fn handle(line: &str, cfg: &mut Config, store: &crate::store::Store) -> Acti
 
 /// Persist the session so restart restores provider, model, URL and key.
 fn persist(store: &crate::store::Store, cfg: &Config) {
-    store.save_provider(cfg.provider.name(), &cfg.model, &cfg.base_url, &cfg.api_key);
+    // A file-backed provider is configured by its JSON entry, not by a row
+    // copied into the database: writing one would go stale the moment the
+    // file changes. The active name is still stored so a restart lands here.
+    if !crate::provider::is_file_backed(cfg.provider.name()) {
+        store.save_provider(cfg.provider.name(), &cfg.model, &cfg.base_url, &cfg.api_key);
+    }
     store.set_active(cfg.provider.name());
 }
 
@@ -260,103 +355,152 @@ fn mask(key: &str) -> String {
         return "(not set)".into();
     }
     let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("****{tail}")
+    format!("••••{tail}")
 }
 
 pub fn status(cfg: &Config) -> String {
     // A level wider than the API is reported here as well as where it is set,
     // because the status line is where someone looks to find out what is sent.
     let thinking = match crate::provider::effort_note(&cfg.thinking) {
-        Some(note) if cfg.provider != crate::config::Provider::Anthropic => {
+        Some(note) if cfg.provider.wire() != crate::config::Wire::Anthropic => {
             format!("{} ({note})", cfg.thinking)
         }
         _ => cfg.thinking.clone(),
     };
+    let key = if cfg.api_key.is_empty() {
+        if cfg.provider.requires_key() { "(not set)" } else { "(not needed)" }.to_string()
+    } else {
+        mask(&cfg.api_key)
+    };
+    let custom = if cfg.provider.is_custom() {
+        format!("  (custom, {} API)", cfg.provider.wire().as_str())
+    } else {
+        String::new()
+    };
     format!(
-        "  provider  {}\n  model     {}\n  thinking  {}\n  url       {}\n  key       {}\n  cwd       {}",
+        "  provider  {}{}\n  model     {}\n  thinking  {}\n  url       {}\n  key       {}\n  cwd       {}",
         cfg.provider.name(),
-        cfg.model,
+        custom,
+        if cfg.model.is_empty() { "(not set)" } else { &cfg.model },
         thinking,
         cfg.base_url,
-        mask(&cfg.api_key),
+        key,
         cfg.cwd.display()
     )
 }
 
-fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
-    let mut parts = arg.split_whitespace();
-    let name = match parts.next() {
-        Some(n) => n,
-        None => {
-            return Action::Message(format!(
-                "provider: {}  (available: {})",
-                cfg.provider.name(),
-                PROVIDERS.join(", ")
-            ))
-        }
-    };
-    let provider = match Provider::parse(name) {
-        Some(p) => p,
-        None => {
-            return Action::Problem(format!(
-                "unknown provider: {name} ({})",
-                PROVIDERS.join(" | ")
-            ))
-        }
-    };
-    // Inline overrides so /key and /url need no separate commands:
-    // `/provider openrouter key=sk-.. url=https://.. model=... thinking=high`.
-    // A bare `http...` token is a URL, any other bare token is a model id.
-    let mut key_ov: Option<String> = None;
-    let mut url_ov: Option<String> = None;
-    let mut model_ov: Option<String> = None;
-    let mut think_ov: Option<String> = None;
-    for tok in parts {
+#[derive(Default)]
+struct Options {
+    key: Option<String>,
+    url: Option<String>,
+    model: Option<String>,
+    thinking: Option<String>,
+    wire: Option<Wire>,
+    models: Vec<String>,
+}
+
+/// Parse the `key=` / `url=` / `model=` / `thinking=` / `type=` / `models=`
+/// tokens shared by `/provider` and `/provider add`. A bare `http...` token is
+/// a URL, any other bare token is a model id.
+fn parse_options(rest: &str) -> Result<Options, String> {
+    let mut o = Options::default();
+    for tok in rest.split_whitespace() {
         if let Some((k, v)) = tok.split_once('=') {
             match k {
-                "key" => key_ov = Some(v.to_string()),
-                "url" => url_ov = Some(v.to_string()),
-                "model" => model_ov = Some(v.to_string()),
-                "thinking" => think_ov = Some(v.to_string()),
-                _ => return Action::Problem(format!("unknown option: {k} (key=, url=, model=, thinking=)")),
+                "key" | "api_key" | "apikey" => o.key = Some(v.to_string()),
+                "url" | "base_url" | "base-url" => o.url = Some(v.to_string()),
+                "model" => o.model = Some(v.to_string()),
+                "thinking" => o.thinking = Some(v.to_string()),
+                "type" | "wire" => match Wire::parse(v) {
+                    Some(w) => o.wire = Some(w),
+                    None => {
+                        return Err(format!(
+                            "unknown provider type {v:?} (use openai or anthropic)"
+                        ))
+                    }
+                },
+                "models" => o
+                    .models
+                    .extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)),
+                _ => {
+                    return Err(format!(
+                        "unknown option: {k} (key=, url=, model=, thinking=, type=, models=)"
+                    ))
+                }
             }
         } else if tok.starts_with("http://") || tok.starts_with("https://") {
-            url_ov = Some(tok.to_string());
+            o.url = Some(tok.to_string());
         } else {
-            model_ov = Some(tok.to_string());
+            o.model = Some(tok.to_string());
         }
     }
-    if let Some(t) = &think_ov {
+    if let Some(t) = &o.thinking {
         if !crate::config::THINKING_LEVELS.contains(&t.as_str()) {
-            return Action::Problem(format!(
+            return Err(format!(
                 "unknown thinking level: {t} ({})",
                 crate::config::THINKING_LEVELS.join("|")
             ));
         }
     }
-    match cfg.switch_provider(provider, store) {
+    Ok(o)
+}
+
+fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Action::Providers;
+    }
+    let (name, rest) = match arg.split_once(char::is_whitespace) {
+        Some((n, r)) => (n, r.trim()),
+        None => (arg, ""),
+    };
+    if name.eq_ignore_ascii_case("add") {
+        return provider_add(rest, cfg, store);
+    }
+    if name.eq_ignore_ascii_case("remove") {
+        return provider_remove(rest, cfg, store);
+    }
+    let provider = match Provider::resolve(name, store) {
+        Some(p) => p,
+        None => {
+            return Action::Problem(format!(
+                "unknown provider: {name} (built-in: {}; add a custom one with /provider add {name} url=<url>)",
+                PROVIDERS.join(" | ")
+            ))
+        }
+    };
+    let opts = match parse_options(rest) {
+        Ok(o) => o,
+        Err(e) => return Action::Problem(e),
+    };
+    match cfg.switch_provider(&provider, store) {
         Ok(()) => {
-            if let Some(m) = model_ov {
+            if let Some(m) = opts.model {
                 cfg.model = m;
             }
-            if let Some(u) = url_ov {
+            if let Some(u) = opts.url {
                 cfg.base_url = normalize_url(&u);
             }
-            if let Some(k) = key_ov {
+            if let Some(k) = opts.key {
                 cfg.api_key = k;
             }
-            if let Some(t) = think_ov {
+            if let Some(t) = opts.thinking {
                 cfg.thinking = t.clone();
                 store.set_thinking(provider.name(), &t);
             }
             persist(store, cfg);
+            let custom = if provider.is_custom() {
+                format!(" (custom, {} API)", provider.wire().as_str())
+            } else {
+                String::new()
+            };
             let msg = format!(
-                "switched to {}, model {}, url {}",
+                "switched to {}{custom}, model {}, url {}",
                 provider.name(),
-                cfg.model,
+                if cfg.model.is_empty() { "(not set: /model)" } else { &cfg.model },
                 cfg.base_url
             );
-            if cfg.api_key.is_empty() {
+            if cfg.api_key.is_empty() && provider.requires_key() {
                 return Action::NeedKey { msg, env: provider.key_env() };
             }
             Action::Changed(msg)
@@ -365,16 +509,164 @@ fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action 
     }
 }
 
+/// `/provider add <name> url=<url> [type=openai|anthropic] [key=] [model=]
+/// [models=a,b] [thinking=]`: register (or update) a custom endpoint. A key is
+/// optional, so local servers work with no secret at all.
+fn provider_add(rest: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
+    let mut name: Option<String> = None;
+    let mut extra: Option<String> = None;
+    let mut options: Vec<String> = Vec::new();
+    for tok in rest.split_whitespace() {
+        if tok.contains('=') {
+            options.push(tok.to_string());
+        } else if tok.starts_with("http://") || tok.starts_with("https://") {
+            // A bare URL is still a URL: `/provider add ollama http://...`.
+            options.push(format!("url={tok}"));
+        } else if name.is_none() {
+            name = Some(tok.to_ascii_lowercase());
+        } else {
+            extra = Some(tok.to_string());
+        }
+    }
+    let Some(name) = name else {
+        return Action::Problem(
+            "usage: /provider add <name> [url=<url>] [type=openai|anthropic] [key=] [model=] [models=a,b]"
+                .into(),
+        );
+    };
+    if let Some(word) = extra {
+        return Action::Problem(format!(
+            "unexpected word {word:?} in /provider add (only the name is positional)"
+        ));
+    }
+    if Provider::builtin(&name).is_some() {
+        return Action::Problem(format!(
+            "{name} is built in; set its key with /provider {name} key=<key>"
+        ));
+    }
+    if name == "add" || name == "remove" {
+        return Action::Problem(format!("{name} is not a usable provider name"));
+    }
+    if !valid_custom_name(&name) {
+        return Action::Problem(
+            "provider names use letters, digits, '-' and '_' (max 32 chars), e.g. ollama"
+                .into(),
+        );
+    }
+    if crate::provider::is_file_backed(&name) {
+        return Action::Problem(format!(
+            "{name} is defined in {}; edit that file to change it",
+            crate::config::providers_path().display()
+        ));
+    }
+    let opts = match parse_options(&options.join(" ")) {
+        Ok(o) => o,
+        Err(e) => return Action::Problem(e),
+    };
+    let url = match opts.url {
+        Some(u) => u,
+        None => match local_default_url(&name) {
+            Some(u) => u.to_string(),
+            None => {
+                return Action::Problem(
+                    "a custom provider needs a base URL: /provider add <name> url=<url>".into(),
+                )
+            }
+        },
+    };
+    let url = normalize_url(&url);
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Action::Problem(format!("the base URL must start with http:// or https:// (got {url:?})"));
+    }
+    // Re-adding an existing endpoint updates it: fields that were not given
+    // keep what the provider already has, so rotating a URL cannot erase a key
+    // or a chosen model by accident.
+    let existing = store.provider_state(&name);
+    let wire = opts
+        .wire
+        .or_else(|| existing.as_ref().and_then(|s| Wire::parse(&s.kind)))
+        .unwrap_or(Wire::OpenAi);
+    let provider = Provider::custom(&name, wire);
+    let key = opts
+        .key
+        .or_else(|| provider.env_key())
+        .or_else(|| existing.as_ref().map(|s| s.api_key.clone()).filter(|k| !k.is_empty()))
+        .unwrap_or_default();
+    // One model in `models=` is unambiguous; take it as the default so the
+    // endpoint is usable immediately.
+    let model = opts
+        .model
+        .or_else(|| (opts.models.len() == 1).then(|| opts.models[0].clone()))
+        .or_else(|| existing.as_ref().map(|s| s.model.clone()).filter(|m| !m.is_empty()))
+        .unwrap_or_default();
+    store.save_custom_provider(&name, wire.as_str(), &model, &url, &key);
+    if !opts.models.is_empty() {
+        store.save_models(&name, &opts.models);
+    }
+    if let Some(t) = &opts.thinking {
+        store.set_thinking(&name, t);
+    }
+    let _ = cfg.switch_provider(&provider, store);
+    persist(store, cfg);
+    let key_note = if key.is_empty() { ", no key" } else { ", key saved" };
+    Action::Changed(format!(
+        "added custom provider {name} ({} API) at {url}{key_note}. Its models join /model",
+        wire.as_str()
+    ))
+}
+
+/// `/provider remove <name>`: forget a custom endpoint. Built-ins stay.
+fn provider_remove(rest: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
+    let name = match rest.split_whitespace().next() {
+        Some(n) => n.to_ascii_lowercase(),
+        None => return Action::Problem("usage: /provider remove <name>".into()),
+    };
+    if Provider::builtin(&name).is_some() {
+        return Action::Problem(format!("cannot remove built-in provider {name}"));
+    }
+    if crate::provider::is_file_backed(&name) {
+        return Action::Problem(format!(
+            "{name} is defined in {}; remove it from that file",
+            crate::config::providers_path().display()
+        ));
+    }
+    if store.provider_state(&name).is_none() {
+        return Action::Problem(format!("no custom provider named {name}"));
+    }
+    store.remove_provider(&name);
+    if cfg.provider.name() == name {
+        if let Some(fallback) = Provider::builtin("anthropic") {
+            let _ = cfg.switch_provider(&fallback, store);
+            persist(store, cfg);
+            return Action::Changed(format!("removed {name}; switched to anthropic"));
+        }
+    }
+    Action::Changed(format!("removed custom provider {name}"))
+}
+
 fn model(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
     if arg.is_empty() {
         return Action::Models;
     }
-    // Picking another connected provider's model switches to it.
+    // Picking another connected provider's model switches to it. When two
+    // providers list the same id, a provider file entry is the intended source
+    // (it is the one the user wrote down), then the current provider.
     let catalog = connected_catalog(store);
-    if let Some((owner, _)) = catalog.iter().find(|(_, id)| id == arg) {
+    let owners: Vec<&String> = catalog
+        .iter()
+        .filter(|(_, id)| id == arg)
+        .map(|(owner, _)| owner)
+        .collect();
+    let owner = owners
+        .iter()
+        .find(|p| crate::provider::is_file_backed(p.as_str()))
+        .or_else(|| owners.iter().find(|p| p.as_str() == cfg.provider.name()))
+        .or_else(|| owners.first())
+        .map(|p| p.as_str());
+    if let Some(owner) = owner {
         if owner != cfg.provider.name() {
-            if let Some(p) = Provider::parse(owner) {
-                if cfg.switch_provider(p, store).is_ok() {
+            if let Some(p) = Provider::resolve(owner, store) {
+                if cfg.switch_provider(&p, store).is_ok() {
                     cfg.model = arg.to_string();
                     persist(store, cfg);
                     return Action::Changed(format!(
@@ -469,7 +761,7 @@ mod tests {
                 }
                 _ => panic!("expected NeedKey"),
             }
-            assert_eq!(cfg.provider, Provider::Openrouter);
+            assert_eq!(cfg.provider, Provider::builtin("openrouter").unwrap());
             assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
             assert_eq!(store.active_provider().as_deref(), Some("openrouter"));
         });
@@ -530,7 +822,7 @@ mod tests {
                 Action::Changed(m) => assert!(m.contains("switched to openrouter"), "{m}"),
                 _ => panic!("expected provider switch"),
             }
-            assert_eq!(cfg.provider, Provider::Openrouter);
+            assert_eq!(cfg.provider, Provider::builtin("openrouter").unwrap());
             assert_eq!(cfg.model, "x-ai/grok-4");
             assert_eq!(store.active_provider().as_deref(), Some("openrouter"));
         });
@@ -587,7 +879,7 @@ mod tests {
 
     fn test_cfg() -> Config {
         Config {
-            provider: Provider::Anthropic,
+            provider: Provider::builtin("anthropic").unwrap(),
             model: "x".into(),
             base_url: "http://localhost".into(),
             api_key: String::new(),
@@ -644,7 +936,7 @@ mod tests {
                 Action::Changed(_) => {}
                 _ => panic!("expected Changed"),
             }
-            assert_eq!(cfg.provider, Provider::Openrouter);
+            assert_eq!(cfg.provider, Provider::builtin("openrouter").unwrap());
             assert_eq!(cfg.api_key, "k1");
             assert_eq!(cfg.base_url, "https://example.com");
             assert_eq!(cfg.model, "m1");
@@ -662,19 +954,174 @@ mod tests {
                 Action::Problem(m) => assert!(m.contains("unknown thinking level"), "{m}"),
                 _ => panic!("expected rejection"),
             }
-            assert_eq!(cfg.provider, Provider::Anthropic);
+            assert_eq!(cfg.provider, Provider::builtin("anthropic").unwrap());
         });
     }
 
     #[test]
-    fn bare_provider_lists_without_switching() {
+    fn bare_provider_opens_the_picker_without_switching() {
         let store = Store::memory();
         let mut cfg = test_cfg();
-        match handle("/provider", &mut cfg, &store) {
-            Action::Message(m) => assert!(m.contains("provider:"), "{m}"),
-            _ => panic!("expected status message"),
-        }
-        assert_eq!(cfg.provider, Provider::Anthropic);
+        assert!(matches!(handle("/provider", &mut cfg, &store), Action::Providers));
+        assert_eq!(cfg.provider, Provider::builtin("anthropic").unwrap());
+    }
+
+    #[test]
+    fn custom_providers_are_added_usable_and_removable() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            match handle(
+                "/provider add ollama url=http://localhost:11434/v1 type=openai model=llama3.2",
+                &mut cfg,
+                &store,
+            ) {
+                Action::Changed(m) => assert!(m.contains("added custom provider ollama"), "{m}"),
+                other => panic!("expected add, got {:?}", std::mem::discriminant(&other)),
+            }
+            assert_eq!(cfg.provider, Provider::custom("ollama", Wire::OpenAi));
+            assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+            assert_eq!(cfg.model, "llama3.2");
+            assert!(cfg.api_key.is_empty(), "a local endpoint needs no key");
+            // The connection survives a restart, including its wire shape.
+            let st = store.provider_state("ollama").unwrap();
+            assert_eq!(st.kind, "openai");
+            assert_eq!(store.active_provider().as_deref(), Some("ollama"));
+            // It joins the provider picker and the shared model catalog.
+            let rows = provider_candidates(&store, "ollama");
+            assert!(rows.iter().any(|(n, d)| n == "ollama" && d.contains("current")), "{rows:?}");
+            store.save_models("ollama", &["llama3.2".to_string()]);
+            assert!(connected_catalog(&store)
+                .iter()
+                .any(|(p, id)| p == "ollama" && id == "llama3.2"));
+            // And it can be removed; the session falls back to a built-in.
+            match handle("/provider remove ollama", &mut cfg, &store) {
+                Action::Changed(m) => assert!(m.contains("switched to anthropic"), "{m}"),
+                _ => panic!("expected removal"),
+            }
+            assert!(store.provider_state("ollama").is_none());
+            assert_eq!(cfg.provider, Provider::builtin("anthropic").unwrap());
+        });
+    }
+
+    #[test]
+    fn a_provider_row_from_before_kinds_is_recovered_as_openai() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            // An older build wrote the row without a kind; its cached models
+            // must not disappear from /model after the upgrade.
+            store.save_provider("legacy", "lfm-2", "http://127.0.0.1:8787/v1", "");
+            store.save_models("legacy", &["lfm-2".to_string(), "lfm-2-instruct".to_string()]);
+            let p = Provider::resolve("legacy", &store).expect("legacy row resolved");
+            assert_eq!(p.wire(), Wire::OpenAi);
+            assert!(p.is_custom());
+            assert!(known_providers(&store).iter().any(|p| p.name() == "legacy"));
+            let catalog = connected_catalog(&store);
+            assert!(catalog.iter().any(|(n, id)| n == "legacy" && id == "lfm-2"), "{catalog:?}");
+        });
+    }
+
+    #[test]
+    fn custom_provider_names_and_urls_are_validated() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            for cmd in [
+                "/provider add badly named url=http://x",
+                "/provider add ok name url=http://x",
+                "/provider add no-url",
+                "/provider add nokey url=ftp://x",
+                "/provider add anthropic url=http://x",
+                "/provider add weird url=http://x type=carrier-pigeon",
+            ] {
+                assert!(
+                    matches!(handle(cmd, &mut cfg, &store), Action::Problem(_)),
+                    "{cmd} should be rejected"
+                );
+            }
+            assert!(store.provider_rows().is_empty());
+        });
+    }
+
+    #[test]
+    fn re_adding_a_custom_provider_keeps_its_key_and_model() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            assert!(matches!(
+                handle(
+                    "/provider add proxy url=https://one.example type=anthropic key=secret model=claude-x",
+                    &mut cfg,
+                    &store
+                ),
+                Action::Changed(_)
+            ));
+            assert!(matches!(
+                handle("/provider add proxy url=https://two.example", &mut cfg, &store),
+                Action::Changed(_)
+            ));
+            let st = store.provider_state("proxy").unwrap();
+            assert_eq!(st.base_url, "https://two.example");
+            assert_eq!(st.api_key, "secret", "a URL update erased the key");
+            assert_eq!(st.model, "claude-x", "a URL update erased the model");
+            assert_eq!(st.kind, "anthropic", "a URL update changed the wire shape");
+        });
+    }
+
+    #[test]
+    fn well_known_local_names_need_no_url() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            assert!(matches!(
+                handle("/provider add ollama model=llama3.2", &mut cfg, &store),
+                Action::Changed(_)
+            ));
+            assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+            assert_eq!(cfg.model, "llama3.2");
+            assert!(cfg.api_key.is_empty(), "local endpoints stay keyless");
+        });
+    }
+
+    #[test]
+    fn provider_option_aliases_are_accepted() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            assert!(matches!(
+                handle(
+                    "/provider add proxy base_url=https://proxy.example/v1 api_key=k1 model=m1",
+                    &mut cfg,
+                    &store
+                ),
+                Action::Changed(_)
+            ));
+            let st = store.provider_state("proxy").unwrap();
+            assert_eq!(st.base_url, "https://proxy.example/v1");
+            assert_eq!(st.api_key, "k1");
+            assert_eq!(st.model, "m1");
+        });
+    }
+
+    #[test]
+    fn a_custom_provider_with_one_model_is_ready_immediately() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let mut cfg = test_cfg();
+            assert!(matches!(
+                handle(
+                    "/provider add lmstudio url=http://localhost:1234/v1 models=qwen2.5-coder",
+                    &mut cfg,
+                    &store
+                ),
+                Action::Changed(_)
+            ));
+            assert_eq!(cfg.model, "qwen2.5-coder");
+            assert_eq!(store.cached_models("lmstudio").unwrap().0, vec!["qwen2.5-coder"]);
+            assert!(known_providers(&store)
+                .iter()
+                .any(|p| p.is_custom() && p.name() == "lmstudio"));
+        });
     }
 
     #[test]
