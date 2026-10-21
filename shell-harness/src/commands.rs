@@ -836,6 +836,21 @@ mod tests {
     }
 
     #[test]
+    fn a_tokenharbor_alias_is_not_an_openai_key() {
+        with_clean_env(|| {
+            std::env::set_var("TOKENHARBOR_API_KEY", "thk_live_test");
+            std::env::set_var("OPENAI_API_KEY", "thk_live_test");
+            let openai = Provider::builtin("openai").unwrap();
+            let tokenharbor = Provider::builtin("tokenharbor").unwrap();
+            assert!(openai.env_key().is_none(), "the TokenHarbor shim is not an OpenAI key");
+            assert_eq!(tokenharbor.env_key().as_deref(), Some("thk_live_test"));
+            let rows = provider_candidates(&Store::memory(), "anthropic");
+            let desc = rows.into_iter().find(|(n, _)| n == "openai").unwrap().1;
+            assert!(desc.contains("no key"), "{desc}");
+        });
+    }
+
+    #[test]
     fn the_provider_picker_says_where_a_key_came_from() {
         with_clean_env(|| {
             let store = Store::memory();

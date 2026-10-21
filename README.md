@@ -44,6 +44,10 @@ fallback when no key is stored. Configure as many providers as you like:
 `/model` lists the models from every configured provider together, and picking
 one switches provider automatically.
 
+TokenHarbor's installer also exports its key as `OPENAI_API_KEY` for
+OpenAI-compatible tools. Rift ignores that alias for its OpenAI provider, so
+use `/provider tokenharbor` for TokenHarbor or enter a real OpenAI key.
+
 Custom endpoints (Ollama, LM Studio, vLLM, a third-party gateway) are saved like
 built-ins:
 

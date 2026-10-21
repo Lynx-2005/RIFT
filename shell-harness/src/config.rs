@@ -213,8 +213,22 @@ impl Provider {
     }
 
     /// Reads this provider's key from the environment, if set.
+    ///
+    /// TokenHarbor's installer exports its own key as `OPENAI_API_KEY` so
+    /// OpenAI-compatible clients use its gateway. That is not an OpenAI key:
+    /// sending it to api.openai.com only produces a 401. Ignore the alias and
+    /// let the picker ask for the real key.
     pub fn env_key(&self) -> Option<String> {
-        std::env::var(self.key_env()).ok().filter(|k| !k.is_empty())
+        let key = std::env::var(self.key_env()).ok().filter(|k| !k.is_empty())?;
+        if self.name == "openai" {
+            let tokenharbor = std::env::var("TOKENHARBOR_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            if tokenharbor.as_deref() == Some(key.as_str()) {
+                return None;
+            }
+        }
+        Some(key)
     }
 
     /// Local and third-party endpoints often take no key. Built-ins always do.
