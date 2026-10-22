@@ -81,6 +81,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS contexts(
                provider TEXT NOT NULL, model TEXT NOT NULL, context INTEGER NOT NULL,
                PRIMARY KEY(provider, model));
+             CREATE TABLE IF NOT EXISTS model_thinking(
+               provider TEXT NOT NULL, model TEXT NOT NULL, spec TEXT NOT NULL,
+               PRIMARY KEY(provider, model));
              CREATE TABLE IF NOT EXISTS sessions(
                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,
                provider TEXT NOT NULL, model TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
@@ -196,7 +199,9 @@ impl Store {
             "DELETE FROM providers WHERE name = ?1",
             "DELETE FROM models WHERE provider = ?1",
             "DELETE FROM contexts WHERE provider = ?1",
+            "DELETE FROM model_thinking WHERE provider = ?1",
             "DELETE FROM session WHERE key = 'thinking:' || ?1",
+            "DELETE FROM session WHERE key LIKE 'thinking:' || ?1 || ':%'",
             "DELETE FROM session WHERE key = 'model:' || ?1",
         ] {
             let _ = self.conn.execute(sql, params![name]);
@@ -305,6 +310,116 @@ impl Store {
         q(model).or_else(|| model.split_once('/').and_then(|(_, bare)| q(bare)))
     }
 
+    /// Replace the models.dev reasoning catalog. Local runtimes keep their
+    /// own rows: they describe the model actually running on this machine,
+    /// which the community catalog cannot know.
+    pub fn save_model_thinking(
+        &self,
+        rows: &[(String, String, crate::provider::ThinkingSupport)],
+    ) {
+        let Ok(tx) = self.conn.unchecked_transaction() else { return };
+        let local: Vec<String> = crate::config::LOCAL_PROVIDERS
+            .iter()
+            .map(|name| format!("'{}'", name.replace('\'', "''")))
+            .collect();
+        let sql = format!(
+            "DELETE FROM model_thinking WHERE provider NOT IN ({})",
+            local.join(",")
+        );
+        if tx.execute(&sql, []).is_err() {
+            return;
+        }
+        {
+            let Ok(mut stmt) = tx.prepare(
+                "INSERT OR REPLACE INTO model_thinking(provider, model, spec) VALUES(?1,?2,?3)",
+            ) else {
+                return;
+            };
+            for (provider, model, support) in rows {
+                if crate::config::LOCAL_PROVIDERS.contains(&provider.as_str()) {
+                    continue;
+                }
+                if stmt
+                    .execute(params![provider, model, support.to_json().to_string()])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    /// Replace one provider's reasoning rows. Used by local discovery, whose
+    /// server is authoritative for the models it is actually serving.
+    pub fn save_provider_thinking(
+        &self,
+        provider: &str,
+        map: &[(String, crate::provider::ThinkingSupport)],
+    ) {
+        let Ok(tx) = self.conn.unchecked_transaction() else { return };
+        if tx
+            .execute("DELETE FROM model_thinking WHERE provider = ?1", params![provider])
+            .is_err()
+        {
+            return;
+        }
+        {
+            let Ok(mut stmt) = tx.prepare(
+                "INSERT OR REPLACE INTO model_thinking(provider, model, spec) VALUES(?1,?2,?3)",
+            ) else {
+                return;
+            };
+            for (model, support) in map {
+                if stmt
+                    .execute(params![provider, model, support.to_json().to_string()])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    /// Cached reasoning support for one provider+model, if models.dev or a
+    /// local discovery round described it.
+    pub fn thinking_spec(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<crate::provider::ThinkingSupport> {
+        let spec: String = self
+            .conn
+            .query_row(
+                "SELECT spec FROM model_thinking WHERE provider = ?1 AND model = ?2",
+                params![provider, model],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&spec).ok()?;
+        crate::provider::ThinkingSupport::from_json(&value)
+    }
+
+    /// Every cached row for an exact model id, across providers. The fallback
+    /// for a gateway whose own name is not in models.dev.
+    pub fn thinking_specs_for(&self, model: &str) -> Vec<crate::provider::ThinkingSupport> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT spec FROM model_thinking WHERE model = ?1")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map(params![model], |r| r.get::<_, String>(0))
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|spec| serde_json::from_str::<serde_json::Value>(&spec).ok())
+                    .filter_map(|value| crate::provider::ThinkingSupport::from_json(&value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn models_fresh(&self, provider: &str) -> bool {
         match self.cached_models(provider) {
             Some((ids, at)) => !ids.is_empty() && now_secs().saturating_sub(at) < MODELS_TTL_SECS,
@@ -312,27 +427,8 @@ impl Store {
         }
     }
 
-    /// Autocompact threshold as a percent of the context window (1..=99),
-    /// or `None` when autocompact is off. Same KV table as thinking: no
-    /// schema migration on databases an older build wrote.
-    pub fn get_autocompact(&self) -> Option<u8> {
-        let v: String = self
-            .conn
-            .query_row("SELECT value FROM session WHERE key = 'autocompact'", [], |r| r.get(0))
-            .ok()?;
-        v.parse().ok()
-    }
-
-    pub fn set_autocompact(&self, percent: Option<u8>) {
-        let _ = self.conn.execute(
-            "INSERT INTO session(key, value) VALUES('autocompact', ?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![percent.map(|p| p.to_string()).unwrap_or_else(|| "off".to_string())],
-        );
-    }
-
-    /// Thinking level per provider (`off|minimal|low|medium|high|xhigh|max`).
-    /// KV in the existing `session` table: no schema migration on old DBs.
+    /// Thinking level per provider. This is the legacy row written before
+    /// levels were remembered per model; `model_thinking` below is preferred.
     pub fn get_thinking(&self, provider: &str) -> Option<String> {
         self.conn
             .query_row(
@@ -343,11 +439,39 @@ impl Store {
             .ok()
     }
 
+    /// Writes the legacy per-provider row. Only tests need this: a build that
+    /// remembers levels per model never writes it again, and it lingers only
+    /// so an upgrade still finds the old choice.
+    #[cfg(test)]
     pub fn set_thinking(&self, provider: &str, level: &str) {
         let _ = self.conn.execute(
             "INSERT INTO session(key, value) VALUES('thinking:' || ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![provider, level],
+        );
+    }
+
+    /// The level last chosen for this exact provider+model, falling back to
+    /// the old per-provider row so an upgrade keeps the user's choice.
+    pub fn get_model_thinking(&self, provider: &str, model: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM session WHERE key = 'thinking:' || ?1 || ':' || ?2",
+                params![provider, model],
+                |r| r.get(0),
+            )
+            .ok()
+            .or_else(|| self.get_thinking(provider))
+    }
+
+    pub fn set_model_thinking(&self, provider: &str, model: &str, level: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let _ = self.conn.execute(
+            "INSERT INTO session(key, value) VALUES('thinking:' || ?1 || ':' || ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![provider, model, level],
         );
     }
 
@@ -537,13 +661,17 @@ mod tests {
         // Removal takes the row and everything cached about it.
         s.save_models("localbox", &["qwen2.5".to_string()]);
         s.save_contexts("localbox", &[("qwen2.5".to_string(), 32_000)]);
+        s.save_provider_thinking("localbox", &[("qwen2.5".into(), support(&["low", "high"]))]);
         s.set_thinking("localbox", "low");
+        s.set_model_thinking("localbox", "qwen2.5", "high");
         s.remember_model("localbox", "qwen2.5");
         s.remove_provider("localbox");
         assert!(s.provider_state("localbox").is_none());
         assert!(s.cached_models("localbox").is_none());
         assert!(s.context_of("localbox", "qwen2.5").is_none());
         assert!(s.get_thinking("localbox").is_none());
+        assert!(s.thinking_spec("localbox", "qwen2.5").is_none());
+        assert!(s.get_model_thinking("localbox", "qwen2.5").is_none());
         assert!(s.remembered_model("localbox").is_none());
         assert!(s.provider_rows().is_empty());
     }
@@ -568,16 +696,82 @@ mod tests {
         assert_eq!(s.get_thinking("openrouter").as_deref(), Some("off"));
     }
 
+    fn support(effort: &[&str]) -> crate::provider::ThinkingSupport {
+        crate::provider::ThinkingSupport {
+            known: true,
+            reasoning: true,
+            effort: effort.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn autocompact_threshold_roundtrips_and_turns_off() {
+    fn a_thinking_level_belongs_to_its_provider_and_model() {
         let s = Store::memory();
-        assert!(s.get_autocompact().is_none());
-        s.set_autocompact(Some(80));
-        assert_eq!(s.get_autocompact(), Some(80));
-        s.set_autocompact(Some(45));
-        assert_eq!(s.get_autocompact(), Some(45));
-        s.set_autocompact(None);
-        assert!(s.get_autocompact().is_none(), "off must clear the threshold");
+        // An upgrade finds the old per-provider row until a model has its own.
+        s.set_thinking("openai", "low");
+        assert_eq!(s.get_model_thinking("openai", "gpt-5.2").as_deref(), Some("low"));
+        s.set_model_thinking("openai", "gpt-5.2", "high");
+        assert_eq!(s.get_model_thinking("openai", "gpt-5.2").as_deref(), Some("high"));
+        // Another model keeps reading the legacy fallback, not this model's.
+        assert_eq!(s.get_model_thinking("openai", "gpt-4.1").as_deref(), Some("low"));
+        assert_eq!(s.get_thinking("openai").as_deref(), Some("low"), "legacy row untouched");
+        // A model id with a colon (Ollama tags) still roundtrips.
+        s.set_model_thinking("ollama", "qwen3:8b", "off");
+        assert_eq!(s.get_model_thinking("ollama", "qwen3:8b").as_deref(), Some("off"));
+        // An empty model cannot own a level.
+        s.set_model_thinking("openai", "", "max");
+        assert_eq!(s.get_model_thinking("openai", "").as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn reasoning_specs_are_replaced_per_source() {
+        let s = Store::memory();
+        s.save_model_thinking(&[
+            ("openai".into(), "gpt-5.2".into(), support(&["low", "medium", "high"])),
+            // Local runtimes are authoritative for the models they serve.
+            ("ollama".into(), "qwen3:8b".into(), support(&["high"])),
+        ]);
+        assert_eq!(
+            s.thinking_spec("openai", "gpt-5.2").unwrap().effort,
+            vec!["low", "medium", "high"]
+        );
+        assert!(
+            s.thinking_spec("ollama", "qwen3:8b").is_none(),
+            "models.dev rows must not overwrite local discovery"
+        );
+
+        // Discovery writes its own rows and a later models.dev refresh keeps
+        // them, while replacing the community rows wholesale.
+        s.save_provider_thinking("ollama", &[("qwen3:8b".into(), support(&["high", "none"]))]);
+        assert_eq!(
+            s.thinking_spec("ollama", "qwen3:8b").unwrap().effort,
+            vec!["high", "none"]
+        );
+        s.save_model_thinking(&[("openai".into(), "gpt-4.1".into(), support(&[]))]);
+        assert!(s.thinking_spec("openai", "gpt-5.2").is_none(), "stale rows are dropped");
+        assert!(s.thinking_spec("ollama", "qwen3:8b").is_some(), "local rows survive");
+
+        // A stopped server clears its rows.
+        s.save_provider_thinking("ollama", &[]);
+        assert!(s.thinking_spec("ollama", "qwen3:8b").is_none());
+    }
+
+    #[test]
+    fn a_spec_can_be_found_across_providers_for_a_gateway() {
+        let s = Store::memory();
+        s.save_provider_thinking(
+            "openrouter",
+            &[("anthropic/claude-sonnet-4.5".into(), support(&["high"]))],
+        );
+        assert_eq!(
+            s.thinking_specs_for("anthropic/claude-sonnet-4.5")
+                .first()
+                .unwrap()
+                .effort,
+            vec!["high"]
+        );
+        assert!(s.thinking_specs_for("nothing").is_empty());
     }
 
     #[test]

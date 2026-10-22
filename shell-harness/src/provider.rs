@@ -1,6 +1,6 @@
 //! Provider adapters. Everything is normalized to `Msg` / `Turn`, so the agent
 //! loop never cares which vendor is on the other end.
-use crate::config::{Config, Provider, Wire};
+use crate::config::{Config, Provider, Wire, THINKING_LEVELS};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The community model catalog (models.dev) that opencode and pi derive their
@@ -184,6 +184,346 @@ pub struct ModelList {
     pub contexts: Vec<(String, u64)>,
 }
 
+/// The community catalog downloaded from models.dev: context windows and
+/// reasoning metadata. Only models.dev describes reasoning support per model,
+/// so this is what the `/thinking` ladder is built from.
+#[derive(Default)]
+pub struct ModelCatalog {
+    /// Context windows keyed by bare model id (the smallest wins).
+    pub contexts: Vec<(String, u64)>,
+    /// `(provider, model, support)` rows exactly as models.dev publishes them.
+    pub thinking: Vec<(String, String, ThinkingSupport)>,
+}
+
+/// What one model says about reasoning. models.dev publishes `reasoning` plus
+/// `reasoning_options`; a model with no cached row is *unknown*, not
+/// non-reasoning, and is treated as unsupported until metadata arrives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThinkingSupport {
+    pub known: bool,
+    pub reasoning: bool,
+    /// Effort names the API documents (may include `none`).
+    pub effort: Vec<String>,
+    pub budget_min: Option<u32>,
+    pub budget_max: Option<u32>,
+    /// The model can be switched on and off without a graded effort.
+    pub toggle: bool,
+}
+
+impl ThinkingSupport {
+    /// Read models.dev's model entry. `None` means the entry did not say;
+    /// `Some` with `reasoning: false` is an explicit "this model cannot think".
+    pub fn from_model(m: &Value) -> Option<Self> {
+        let reasoning = m.get("reasoning").and_then(Value::as_bool)?;
+        let mut support = Self { known: true, reasoning, ..Self::default() };
+        if !reasoning {
+            return Some(support);
+        }
+        let output_limit = m
+            .get("limit")
+            .and_then(|l| l.get("output"))
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok());
+        support.apply_reasoning_options(m.get("reasoning_options"), output_limit);
+        Some(support)
+    }
+
+    /// Read an explicit `thinking` block from `providers.json`. Unlike
+    /// models.dev, the presence of the block is itself a declaration: the
+    /// user has said whether this endpoint reasons. `None` means the block was
+    /// malformed and should be ignored.
+    pub fn from_config(v: &Value, wire: Wire) -> Option<Self> {
+        let mut support = match v {
+            Value::Bool(reasoning) => Self {
+                known: true,
+                reasoning: *reasoning,
+                toggle: *reasoning,
+                ..Self::default()
+            },
+            Value::Object(map) => {
+                let reasoning = map
+                    .get("supported")
+                    .or_else(|| map.get("reasoning"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let mut support = Self { known: true, reasoning, ..Self::default() };
+                if !reasoning {
+                    return Some(support);
+                }
+                if let Some(values) = map.get("effort").or_else(|| map.get("levels")) {
+                    support.effort = level_values(values);
+                }
+                if let Some(budget) = map.get("budget").or_else(|| map.get("budget_tokens")) {
+                    let (min, max) = budget_bounds(budget);
+                    support.budget_min = min;
+                    support.budget_max = max;
+                }
+                support.toggle = map.get("toggle").and_then(Value::as_bool).unwrap_or(false);
+                support.apply_reasoning_options(map.get("reasoning_options"), None);
+                support
+            }
+            _ => return None,
+        };
+        // The plain OpenAI chat shape has no `enabled` switch. Represent a
+        // toggle as the two effort values both vLLM and llama.cpp understand:
+        // `none` disables, and a normal effort enables.
+        if wire == Wire::OpenAi && support.toggle && support.effort.is_empty() {
+            support.effort = vec!["none".to_string(), "high".to_string()];
+            support.toggle = false;
+        }
+        Some(support)
+    }
+
+    fn apply_reasoning_options(&mut self, options: Option<&Value>, output_limit: Option<u32>) {
+        for option in options.and_then(Value::as_array).into_iter().flatten() {
+            match option.get("type").and_then(Value::as_str) {
+                Some("effort") => {
+                    self.effort = option
+                        .get("values")
+                        .map(level_values)
+                        .unwrap_or_default();
+                }
+                Some("budget_tokens") => {
+                    self.budget_min = option
+                        .get("min")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .or(Some(1024));
+                    self.budget_max = option
+                        .get("max")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .or_else(|| output_limit.map(|limit| limit.saturating_sub(1)));
+                }
+                Some("toggle") => self.toggle = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// The cached form in the store. `known` is implied by the row existing.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "reasoning": self.reasoning,
+            "effort": self.effort,
+            "budget_min": self.budget_min,
+            "budget_max": self.budget_max,
+            "toggle": self.toggle,
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            known: true,
+            reasoning: v.get("reasoning")?.as_bool()?,
+            effort: v
+                .get("effort")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            budget_min: v
+                .get("budget_min")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            budget_max: v
+                .get("budget_max")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            toggle: v.get("toggle").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
+fn level_values(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn budget_bounds(v: &Value) -> (Option<u32>, Option<u32>) {
+    match v {
+        Value::Array(values) => (
+            values
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            values
+                .get(1)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+        ),
+        Value::Object(map) => (
+            map.get("min")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+            map.get("max")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+        ),
+        Value::Number(_) => (
+            None,
+            v.as_u64().and_then(|v| u32::try_from(v).ok()),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// The levels this model exposes through the API shape of `provider`. A
+/// non-reasoning or not-yet-known model exposes only `off`; nothing else is
+/// advertised and no reasoning field is ever sent for it.
+pub fn thinking_levels(
+    support: &ThinkingSupport,
+    provider: &Provider,
+    model: &str,
+) -> Vec<&'static str> {
+    let mut levels = vec!["off"];
+    if !support.known || !support.reasoning {
+        return levels;
+    }
+    match provider.wire() {
+        Wire::Anthropic => {
+            if anthropic_adaptive(model) {
+                // Claude 4.6+ and non-Claude Anthropic endpoints: adaptive
+                // thinking plus `output_config.effort`. A budget-only entry
+                // cannot be encoded safely here, so it advertises no thinking.
+                if !support.effort.is_empty() {
+                    push_effort_levels(&mut levels, &support.effort);
+                } else if support.toggle {
+                    levels.push("high");
+                }
+            } else {
+                // Claude 4.5 and older: `thinking.enabled` with a token budget.
+                if support.budget_min.is_some() || support.budget_max.is_some() {
+                    push_budget_levels(&mut levels);
+                } else if support.toggle {
+                    levels.push("high");
+                }
+            }
+        }
+        Wire::OpenAi => {
+            if provider.name() == "openrouter" {
+                // OpenRouter's unified `reasoning` object speaks all three.
+                if !support.effort.is_empty() {
+                    push_effort_levels(&mut levels, &support.effort);
+                } else if support.budget_min.is_some() || support.budget_max.is_some() {
+                    push_budget_levels(&mut levels);
+                } else if support.toggle {
+                    levels.push("high");
+                }
+            } else if !support.effort.is_empty() {
+                // Plain OpenAI-compatible chat only has `reasoning_effort`.
+                push_effort_levels(&mut levels, &support.effort);
+            }
+        }
+    }
+    levels
+}
+
+fn push_effort_levels(levels: &mut Vec<&'static str>, effort: &[String]) {
+    for level in THINKING_LEVELS.iter().skip(1) {
+        if effort.iter().any(|value| value == level) {
+            levels.push(level);
+        }
+    }
+}
+
+fn push_budget_levels(levels: &mut Vec<&'static str>) {
+    levels.extend(THINKING_LEVELS.iter().skip(1).copied());
+}
+
+/// Pi's clamp: walk up the ladder first, then down. An unknown request falls
+/// back to the model's first supported level (`off`).
+pub fn clamp_thinking<'a>(levels: &[&'a str], requested: &str) -> &'a str {
+    if levels.contains(&requested) {
+        return levels.iter().find(|level| **level == requested).copied().unwrap();
+    }
+    if let Some(index) = THINKING_LEVELS.iter().position(|level| *level == requested) {
+        for candidate in &THINKING_LEVELS[index..] {
+            if levels.contains(candidate) {
+                return candidate;
+            }
+        }
+        for candidate in THINKING_LEVELS[..index].iter().rev() {
+            if levels.contains(candidate) {
+                return candidate;
+            }
+        }
+    }
+    levels.first().copied().unwrap_or("off")
+}
+
+/// Claude 4.6+ uses adaptive thinking; 4.5 and older use a token budget.
+/// Anything that is not recognisably Claude is assumed to speak the modern
+/// shape, because that is the only adaptive-capable shape this harness knows.
+pub fn anthropic_adaptive(model: &str) -> bool {
+    match claude_version(model) {
+        Some((major, minor)) => major > 4 || (major == 4 && minor >= 6),
+        None => true,
+    }
+}
+
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let model = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let parts: Vec<&str> = model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let start = parts.iter().position(|part| *part == "claude")?;
+    let rest = &parts[start + 1..];
+    // Version components are small. A long numeric segment is a release date
+    // (`claude-sonnet-4-20250514`), so the model is 4.0, not 4.20250514.
+    let version = |part: Option<&&str>| {
+        part.and_then(|part| part.parse::<u32>().ok())
+            .filter(|value| *value < 100)
+    };
+    let (major, minor) = if version(rest.first()).is_some() {
+        (version(rest.first())?, version(rest.get(1)).unwrap_or(0))
+    } else {
+        (version(rest.get(1))?, version(rest.get(2)).unwrap_or(0))
+    };
+    Some((major, minor))
+}
+
+/// The token budget a canonical level means for this model. Bounds come from
+/// the model's own metadata; `None` only for `off` and unknown levels.
+pub fn thinking_budget(level: &str, support: &ThinkingSupport) -> Option<u32> {
+    let base = match level {
+        "minimal" => 1024,
+        "low" => 4096,
+        "medium" => 10240,
+        "high" => 20480,
+        "xhigh" => 24576,
+        "max" => 31999,
+        _ => return None,
+    };
+    let min = support.budget_min.unwrap_or(1024).max(1);
+    let max = support.budget_max.unwrap_or(32_000).max(min);
+    Some(base.clamp(min, max))
+}
+
+/// The effort value to send for a level, only when the model advertises it.
+/// `off` maps to `none` only when `none` is one of the documented values.
+pub fn api_effort<'a>(level: &str, support: &'a ThinkingSupport) -> Option<&'a str> {
+    let wanted = if level == "off" { "none" } else { level };
+    support
+        .effort
+        .iter()
+        .find(|value| value.as_str() == wanted)
+        .map(String::as_str)
+}
+
 impl Client {
     pub fn new() -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
@@ -286,88 +626,159 @@ impl Client {
         Ok(ModelList { ids, contexts })
     }
 
-    /// Context windows for every model known to models.dev, keyed by bare
-    /// model id (the same source opencode uses; no API key). Best-effort:
-    /// callers proceed without it on any error.
-    pub fn fetch_model_contexts(&self) -> Vec<(String, u64)> {
-        self.fetch_model_contexts_from(MODELS_DEV_URL)
+    /// Context windows and per-model reasoning metadata from models.dev (the
+    /// same source opencode and pi use; no API key). Best-effort: callers
+    /// proceed without it on any error.
+    pub fn fetch_model_catalog(&self) -> Option<ModelCatalog> {
+        self.fetch_model_catalog_from(MODELS_DEV_URL)
     }
 
     /// The same, against an explicit URL (tests point it at a local server).
-    pub fn fetch_model_contexts_from(&self, url: &str) -> Vec<(String, u64)> {
-        let Ok(body) = self
+    pub fn fetch_model_catalog_from(&self, url: &str) -> Option<ModelCatalog> {
+        let body = self
             .http
             .get(url)
             .timeout(Duration::from_secs(15))
             .send()
-        else {
-            return Vec::new();
-        };
-        let Ok(v) = body.json::<Value>() else { return Vec::new() };
-        let Some(providers) = v.as_object() else { return Vec::new() };
-        let mut out = Vec::new();
-        for p in providers.values() {
+            .ok()?;
+        let v = body.json::<Value>().ok()?;
+        let providers = v.as_object()?;
+        let mut catalog = ModelCatalog::default();
+        for (provider, p) in providers {
             let Some(models) = p.get("models").and_then(Value::as_object) else { continue };
             for (id, m) in models {
-                let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(Value::as_u64)
-                else {
-                    continue;
-                };
-                if ctx > 0 {
-                    // The same id is listed by several providers with
-                    // different windows (200k anthropic, 1M on a 1m tier,
-                    // 198k bedrock). Keep the smallest: a window too small
-                    // compacts one request early, one too large loses the
-                    // request - the reason the heuristic below also errs low.
-                    match out.iter_mut().find(|(seen, _)| seen == id) {
-                        Some(entry) if ctx < entry.1 => entry.1 = ctx,
-                        Some(_) => {}
-                        None => out.push((id.clone(), ctx)),
+                if let Some(ctx) = m.get("limit").and_then(|l| l.get("context")).and_then(Value::as_u64) {
+                    if ctx > 0 {
+                        // The same id is listed by several providers with
+                        // different windows (200k anthropic, 1M on a 1m tier,
+                        // 198k bedrock). Keep the smallest so the context share
+                        // is not understated, the reason the heuristic below also
+                        // errs low.
+                        match catalog.contexts.iter_mut().find(|(seen, _)| seen == id) {
+                            Some(entry) if ctx < entry.1 => entry.1 = ctx,
+                            Some(_) => {}
+                            None => catalog.contexts.push((id.clone(), ctx)),
+                        }
                     }
+                }
+                if let Some(support) = ThinkingSupport::from_model(m) {
+                    catalog
+                        .thinking
+                        .push((provider.clone(), id.clone(), support));
                 }
             }
         }
-        out.sort();
-        out
+        catalog.contexts.sort();
+        Some(catalog)
     }
 }
 
-
-/// Pi-style effort ladder (`off|minimal|low|medium|high|xhigh|max`).
-/// Anthropic's API speaks token budgets for thinking, so each level maps to one
-/// here. The OpenAI-compatible path takes level names instead, and only the
-/// four it documents: see `api_effort`.
-pub fn thinking_budget(level: &str) -> Option<u32> {
-    match level {
-        "minimal" => Some(1024),
-        "low" => Some(4096),
-        "medium" => Some(10240),
-        "high" => Some(20480),
-        "xhigh" => Some(24576),
-        "max" => Some(31999),
-        _ => None, // "off" and unknown: no thinking block
-    }
+/// Resolve a model's reasoning support. An explicit `thinking` block in
+/// `providers.json` wins, then the provider's own models.dev entry, then the
+/// same model on the API-native provider (a Claude model behind an
+/// OpenAI-compatible gateway still has Anthropic's metadata), then any
+/// provider that catalogs the exact id, merged.
+pub fn thinking_support(
+    store: Option<&crate::store::Store>,
+    provider: &Provider,
+    model: &str,
+) -> ThinkingSupport {
+    let file = file_provider(provider.name());
+    thinking_support_from(store, provider, model, file.as_ref())
 }
 
-/// The effort levels an OpenAI-compatible API accepts. The ladder above is
-/// wider than this API's vocabulary, and an unsupported value is a rejected
-/// request rather than something a server tolerates, so the top of the ladder
-/// clamps to `high` and says so (`effort_note`).
-pub fn api_effort(level: &str) -> Option<&'static str> {
-    match level {
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
-        _ => None, // "off" and anything unrecognized: no effort field at all
+/// The same resolution with the provider-file entry already loaded. Tests use
+/// this directly because `file_provider` is disabled under `cfg(test)`.
+pub(crate) fn thinking_support_from(
+    store: Option<&crate::store::Store>,
+    provider: &Provider,
+    model: &str,
+    file: Option<&FileProvider>,
+) -> ThinkingSupport {
+    if model.trim().is_empty() {
+        return ThinkingSupport::default();
     }
+    if let Some(found) = file.and_then(|f| f.thinking_for(model)) {
+        return found;
+    }
+    let Some(store) = store else { return ThinkingSupport::default() };
+    if let Some(found) = lookup_model(store, provider.name(), model) {
+        return found;
+    }
+    // Anthropic metadata describes the model itself; OpenRouter's row
+    // describes its own unified API, so it is only the last resort behind the
+    // native provider. A Claude model behind a gateway must not inherit
+    // OpenRouter's gateway-specific effort rules.
+    let preferred: &[&str] = match provider.wire() {
+        Wire::Anthropic => &["anthropic", "openrouter"],
+        Wire::OpenAi if provider.name() == "openrouter" => &["openrouter", "openai", "anthropic"],
+        Wire::OpenAi => &["openai", "anthropic", "openrouter"],
+    };
+    for name in preferred {
+        if *name == provider.name() {
+            continue;
+        }
+        if let Some(found) = lookup_model(store, name, model) {
+            return found;
+        }
+    }
+    let mut found = store.thinking_specs_for(model);
+    if let Some((_, bare)) = model.split_once('/') {
+        found.extend(store.thinking_specs_for(bare));
+    }
+    found.into_iter().reduce(merge_support).unwrap_or_default()
 }
 
-/// How a clamped level is reported, so the request never quietly changes the
-/// setting behind the user's back. `None` when nothing is being changed.
-pub fn effort_note(level: &str) -> Option<String> {
-    let sent = api_effort(level)?;
-    (sent != level).then(|| format!("this API takes minimal, low, medium, high: sending {sent}"))
+fn lookup_model(
+    store: &crate::store::Store,
+    provider: &str,
+    model: &str,
+) -> Option<ThinkingSupport> {
+    // Anthropic ids mix dots and dashes (`claude-haiku-4.5` vs
+    // `claude-haiku-4-5`); try both spellings, with and without a vendor
+    // prefix.
+    let mut candidates = vec![model.to_string()];
+    if let Some((_, bare)) = model.split_once('/') {
+        candidates.push(bare.to_string());
+    }
+    for candidate in candidates.clone() {
+        if candidate.contains('.') {
+            candidates.push(candidate.replace('.', "-"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|candidate| store.thinking_spec(provider, &candidate))
+}
+
+fn merge_support(a: ThinkingSupport, b: ThinkingSupport) -> ThinkingSupport {
+    let mut effort = Vec::new();
+    for value in ["none", "default", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        if a.effort.iter().any(|v| v == value) || b.effort.iter().any(|v| v == value) {
+            effort.push(value.to_string());
+        }
+    }
+    for value in a.effort.iter().chain(b.effort.iter()) {
+        if !effort.contains(value) {
+            effort.push(value.clone());
+        }
+    }
+    ThinkingSupport {
+        known: a.known || b.known,
+        reasoning: a.reasoning || b.reasoning,
+        effort,
+        budget_min: match (a.budget_min, b.budget_min) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
+        },
+        budget_max: match (a.budget_max, b.budget_max) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, None) => x,
+            (None, y) => y,
+        },
+        toggle: a.toggle || b.toggle,
+    }
 }
 
 fn send_with_retry(
@@ -734,10 +1145,44 @@ fn anthropic_request(
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.iter().map(anthropic_schema).collect());
         }
-        // Budget-based thinking (older Claude API); newer models ignore it.
-        if let Some(budget) = thinking_budget(&cfg.thinking) {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-            body["max_tokens"] = json!(8192 + budget as i64);
+        // Only a level this model actually supports is sent. Claude 4.6+
+        // takes adaptive thinking plus an effort; older Claude takes a token
+        // budget, and a model that documents only a switch gets just that.
+        // A model that documents a toggle can be explicitly disabled; on the
+        // others `off` is the absence of the field (their default).
+        if cfg.thinking_support.known
+            && cfg.thinking_support.reasoning
+            && thinking_levels(&cfg.thinking_support, &cfg.provider, &cfg.model)
+                .contains(&cfg.thinking.as_str())
+        {
+            let has_budget = cfg.thinking_support.budget_min.is_some()
+                || cfg.thinking_support.budget_max.is_some();
+            if anthropic_adaptive(&cfg.model) {
+                if cfg.thinking == "off" {
+                    if cfg.thinking_support.toggle {
+                        body["thinking"] = json!({"type": "disabled"});
+                    }
+                } else if let Some(effort) = api_effort(&cfg.thinking, &cfg.thinking_support) {
+                    body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+                    body["output_config"] = json!({"effort": effort});
+                } else if cfg.thinking_support.toggle {
+                    body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+                }
+            } else if cfg.thinking == "off" {
+                // Older models default to thinking off when the field is
+                // absent, so there is nothing to send.
+            } else if has_budget {
+                // A budget the metadata does not bound is not invented here:
+                // the toggle branch below is for switch-only models.
+                if let Some(budget) = thinking_budget(&cfg.thinking, &cfg.thinking_support) {
+                    body["thinking"] =
+                        json!({"type": "enabled", "budget_tokens": budget, "display": "summarized"});
+                    body["max_tokens"] = json!(8192 + budget as i64);
+                }
+            } else if cfg.thinking_support.toggle {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
+                body["max_tokens"] = json!(8192 + 1024);
+            }
         }
         let headers = vec![
             ("x-api-key", cfg.api_key.clone()),
@@ -795,10 +1240,46 @@ fn openai_request(
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.iter().map(openai_schema).collect());
         }
-        // Clamped to what this API documents: `xhigh` and `max` are real
-        // levels elsewhere, and a rejected request here.
-        if let Some(effort) = api_effort(&cfg.thinking) {
-            body["reasoning_effort"] = json!(effort);
+        // Only a level this model advertises is sent. OpenRouter gets its
+        // unified `reasoning` object (effort, max_tokens, or enabled); every
+        // other OpenAI-compatible endpoint gets `reasoning_effort` only when
+        // the model documents effort values.
+        if cfg.thinking_support.known && cfg.thinking_support.reasoning {
+            let levels = thinking_levels(&cfg.thinking_support, &cfg.provider, &cfg.model);
+            if levels.contains(&cfg.thinking.as_str()) {
+                if cfg.provider.name() == "openrouter" {
+                    let mut reasoning = serde_json::Map::new();
+                    if let Some(effort) = api_effort(&cfg.thinking, &cfg.thinking_support) {
+                        reasoning.insert("effort".into(), json!(effort));
+                    } else if cfg.thinking == "off"
+                        && (cfg.thinking_support.toggle
+                            || !cfg.thinking_support.effort.is_empty()
+                            || cfg.thinking_support.budget_min.is_some()
+                            || cfg.thinking_support.budget_max.is_some())
+                    {
+                        // `none` was not one of the documented efforts, but
+                        // the unified API still has an explicit off switch.
+                        reasoning.insert("enabled".into(), json!(false));
+                    } else if cfg.thinking_support.budget_min.is_some()
+                        || cfg.thinking_support.budget_max.is_some()
+                    {
+                        // A budget is sent only when the model documents one;
+                        // otherwise a switch-only model gets `enabled`.
+                        if let Some(budget) =
+                            thinking_budget(&cfg.thinking, &cfg.thinking_support)
+                        {
+                            reasoning.insert("max_tokens".into(), json!(budget));
+                        }
+                    } else if cfg.thinking_support.toggle {
+                        reasoning.insert("enabled".into(), json!(true));
+                    }
+                    if !reasoning.is_empty() {
+                        body["reasoning"] = Value::Object(reasoning);
+                    }
+                } else if let Some(effort) = api_effort(&cfg.thinking, &cfg.thinking_support) {
+                    body["reasoning_effort"] = json!(effort);
+                }
+            }
         }
         // OpenRouter honors these optional headers for attribution/rate limits.
         // A keyless custom endpoint gets no Authorization header at all: an
@@ -815,11 +1296,6 @@ fn openai_request(
         (format!("{}/chat/completions", cfg.base_url), body, headers)
     }
 
-/// The model's context window, for autocompact's percentage to be a fraction
-/// of. Providers do not report it on the wire, so this is a guess from the
-/// model id. Every guess errs low: compacting a little early costs one
-/// summarization, while guessing a window too wide can overflow the request
-/// and lose the turn.
 /// The model's context window. An exact id learned from a real source (the
 /// provider's own `/models` list, or models.dev) wins; without one the old
 /// substring guess applies, erring low. `provider` selects the store's table;
@@ -1013,6 +1489,33 @@ pub struct FileProvider {
     pub name: String,
     pub state: crate::store::ProviderState,
     pub models: Vec<String>,
+    /// Reasoning support declared for every model this provider serves.
+    pub thinking: Option<ThinkingSupport>,
+    /// Per-model overrides, keyed by the exact model id in the file.
+    pub model_thinking: Vec<(String, ThinkingSupport)>,
+}
+
+impl FileProvider {
+    /// The declared support for one model: its own entry wins, then the
+    /// provider-wide block. `None` leaves the question to discovery and
+    /// models.dev.
+    pub fn thinking_for(&self, model: &str) -> Option<ThinkingSupport> {
+        let mut candidates = vec![model.to_string()];
+        if let Some((_, bare)) = model.split_once('/') {
+            candidates.push(bare.to_string());
+        }
+        for candidate in candidates.clone() {
+            if candidate.contains('.') {
+                candidates.push(candidate.replace('.', "-"));
+            }
+        }
+        candidates.into_iter().find_map(|candidate| {
+            self.model_thinking
+                .iter()
+                .find(|(id, _)| id == &candidate)
+                .map(|(_, support)| support.clone())
+        }).or_else(|| self.thinking.clone())
+    }
 }
 
 fn text_field<'a>(
@@ -1025,9 +1528,29 @@ fn text_field<'a>(
         .filter(|s| !s.is_empty())
 }
 
-/// Model ids from either an array of strings/objects or an object keyed by id.
-fn models_from(v: Option<&Value>) -> Vec<String> {
+/// Model ids and any per-model `thinking` blocks from either an array of
+/// strings/objects or an object keyed by id.
+fn models_from(
+    v: Option<&Value>,
+    wire: Wire,
+) -> (Vec<String>, Vec<(String, ThinkingSupport)>) {
     let mut out: Vec<String> = Vec::new();
+    let mut thinking = Vec::new();
+    let mut add = |id: String, spec: Option<&Value>| {
+        if id.is_empty() {
+            return;
+        }
+        if !out.iter().any(|m| m == &id) {
+            out.push(id.clone());
+        }
+        if let Some(support) = spec
+            .and_then(|spec| spec.get("thinking"))
+            .and_then(|v| ThinkingSupport::from_config(v, wire))
+        {
+            thinking.retain(|(seen, _)| seen != &id);
+            thinking.push((id, support));
+        }
+    };
     match v {
         Some(Value::Array(items)) => {
             for item in items {
@@ -1038,22 +1561,17 @@ fn models_from(v: Option<&Value>) -> Vec<String> {
                         .to_string(),
                     _ => String::new(),
                 };
-                if !id.is_empty() && !out.contains(&id) {
-                    out.push(id);
-                }
+                add(id, Some(item));
             }
         }
         Some(Value::Object(map)) => {
-            for id in map.keys() {
-                let id = id.trim();
-                if !id.is_empty() && !out.iter().any(|m| m == id) {
-                    out.push(id.to_string());
-                }
+            for (id, spec) in map {
+                add(id.trim().to_string(), Some(spec));
             }
         }
         _ => {}
     }
-    out
+    (out, thinking)
 }
 
 /// Parse the provider file. One object maps each provider name to its settings,
@@ -1090,7 +1608,10 @@ pub(crate) fn parse_providers(text: &str) -> Result<Vec<FileProvider>, String> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             continue;
         }
-        let models = models_from(spec.get("models"));
+        let (models, model_thinking) = models_from(spec.get("models"), wire);
+        let thinking = spec
+            .get("thinking")
+            .and_then(|v| ThinkingSupport::from_config(v, wire));
         let model = text_field(spec, &["model"])
             .map(str::to_string)
             .or_else(|| models.first().cloned())
@@ -1111,6 +1632,8 @@ pub(crate) fn parse_providers(text: &str) -> Result<Vec<FileProvider>, String> {
                 kind: wire.as_str().to_string(),
             },
             models,
+            thinking,
+            model_thinking,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1348,26 +1871,295 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
     }
 
-    #[test]
-    fn thinking_budget_ladder() {
-        assert_eq!(thinking_budget("off"), None);
-        assert_eq!(thinking_budget("bogus"), None);
-        assert_eq!(thinking_budget("minimal"), Some(1024));
-        assert_eq!(thinking_budget("medium"), Some(10240));
-        assert_eq!(thinking_budget("max"), Some(31999));
+    /// The support one model would report: effort values, budget bounds or a
+    /// plain toggle, exactly as models.dev publishes them.
+    fn support(effort: &[&str], budget: Option<(u32, u32)>, toggle: bool) -> ThinkingSupport {
+        ThinkingSupport {
+            known: true,
+            reasoning: !effort.is_empty() || budget.is_some() || toggle,
+            effort: effort.iter().map(|s| s.to_string()).collect(),
+            budget_min: budget.map(|(min, _)| min),
+            budget_max: budget.map(|(_, max)| max),
+            toggle,
+        }
     }
 
     #[test]
-    fn openai_effort_is_clamped_to_the_levels_that_api_documents() {
-        assert_eq!(api_effort("off"), None, "off must send no effort field");
-        assert_eq!(api_effort("unknown"), None);
-        assert_eq!(api_effort("medium"), Some("medium"));
-        assert_eq!(api_effort("xhigh"), Some("high"));
-        assert_eq!(api_effort("max"), Some("high"));
+    fn thinking_budget_uses_the_models_own_bounds() {
+        let s = support(&[], Some((2048, 20_000)), false);
+        assert_eq!(thinking_budget("off", &s), None);
+        assert_eq!(thinking_budget("bogus", &s), None);
+        // The canonical figures are clamped into the documented range.
+        assert_eq!(thinking_budget("minimal", &s), Some(2048));
+        assert_eq!(thinking_budget("medium", &s), Some(10240));
+        assert_eq!(thinking_budget("max", &s), Some(20_000));
+        // A model with no bounds at all keeps the canonical figures.
+        let open = support(&[], None, false);
+        assert_eq!(thinking_budget("minimal", &open), Some(1024));
+        assert_eq!(thinking_budget("max", &open), Some(31_999));
+    }
 
-        assert!(effort_note("medium").is_none(), "nothing was changed");
-        let note = effort_note("max").unwrap();
-        assert!(note.contains("sending high"), "{note}");
+    #[test]
+    fn api_effort_only_returns_documented_values() {
+        let s = support(&["low", "medium", "high"], None, false);
+        assert_eq!(api_effort("off", &s), None, "no `none`: off sends no field");
+        assert_eq!(api_effort("unknown", &s), None);
+        assert_eq!(api_effort("medium", &s), Some("medium"));
+        // xhigh and max are not documented by this model, so they are not
+        // translated into some other value; they are simply not sent.
+        assert_eq!(api_effort("xhigh", &s), None);
+        assert_eq!(api_effort("max", &s), None);
+        // off is sendable only when `none` is one of the documented values.
+        let s = support(&["none", "low", "medium", "high", "xhigh"], None, false);
+        assert_eq!(api_effort("off", &s), Some("none"));
+        assert_eq!(api_effort("xhigh", &s), Some("xhigh"));
+    }
+
+    #[test]
+    fn a_models_levels_are_the_ladder_subset_it_documents() {
+        let provider = Provider::builtin("openai").unwrap();
+        let s = support(&["low", "medium", "high"], None, false);
+        assert_eq!(
+            thinking_levels(&s, &provider, "gpt-5.2"),
+            vec!["off", "low", "medium", "high"]
+        );
+        // A non-reasoning model offers only off, whatever the ladder says.
+        let s = support(&[], None, false);
+        assert_eq!(thinking_levels(&s, &provider, "gpt-4.1"), vec!["off"]);
+        // An unknown model is treated the same: nothing is sent until the
+        // catalog describes it.
+        let unknown = ThinkingSupport::default();
+        assert_eq!(thinking_levels(&unknown, &provider, "m"), vec!["off"]);
+    }
+
+    #[test]
+    fn support_is_resolved_by_provider_then_by_native_metadata() {
+        let store = crate::store::Store::memory();
+        store.save_provider_thinking(
+            "anthropic",
+            &[(
+                "claude-sonnet-4-6".into(),
+                support(&["low", "medium", "high"], None, false),
+            )],
+        );
+        store.save_provider_thinking(
+            "openrouter",
+            &[(
+                "anthropic/claude-sonnet-4.6".into(),
+                support(&[], None, true),
+            )],
+        );
+
+        // Anthropic ids mix dots and dashes; both spellings resolve.
+        let anthropic = Provider::builtin("anthropic").unwrap();
+        let s = thinking_support(Some(&store), &anthropic, "claude-sonnet-4.6");
+        assert_eq!(s.effort, vec!["low", "medium", "high"]);
+
+        // On OpenRouter its own row wins: that is the API being called.
+        let openrouter = Provider::builtin("openrouter").unwrap();
+        let s = thinking_support(Some(&store), &openrouter, "anthropic/claude-sonnet-4.6");
+        assert!(s.toggle && s.effort.is_empty());
+
+        // A gateway serving the same Claude id falls back to Anthropic's
+        // native metadata, not OpenRouter's gateway-specific row.
+        let gateway = Provider::custom("gateway", Wire::OpenAi);
+        let s = thinking_support(Some(&store), &gateway, "anthropic/claude-sonnet-4.6");
+        assert_eq!(s.effort, vec!["low", "medium", "high"]);
+
+        // No provider owns the id: rows for the same model are merged.
+        store.save_provider_thinking(
+            "alpha",
+            &[("vendor/m".into(), support(&["low"], None, false))],
+        );
+        store.save_provider_thinking(
+            "beta",
+            &[("vendor/m".into(), support(&["high"], Some((1024, 4096)), false))],
+        );
+        let s = thinking_support(Some(&store), &gateway, "vendor/m");
+        assert_eq!(s.effort, vec!["low", "high"]);
+        assert_eq!(s.budget_min, Some(1024));
+        assert_eq!(s.budget_max, Some(4096));
+    }
+
+    #[test]
+    fn budget_only_models_under_the_anthropic_wire() {
+        let provider = Provider::builtin("anthropic").unwrap();
+        let s = support(&[], Some((1024, 32_000)), false);
+        // Claude 4.5 and older take a token budget: the whole ladder fits.
+        assert_eq!(
+            thinking_levels(&s, &provider, "claude-sonnet-4-5"),
+            vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        // Claude 4.6+ speaks adaptive thinking plus effort. A budget cannot be
+        // encoded as an effort, so a budget-only entry exposes off alone.
+        assert_eq!(thinking_levels(&s, &provider, "claude-sonnet-4-6"), vec!["off"]);
+        // A dated Claude 4 id is 4.0, not 4.<release date>, and stays on the
+        // budget shape where its metadata can be sent.
+        assert!(!anthropic_adaptive("claude-sonnet-4-20250514"));
+        assert!(!anthropic_adaptive("claude-3-opus-20240229"));
+        assert_eq!(
+            thinking_levels(&s, &provider, "claude-sonnet-4-20250514"),
+            vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        // The dotted and minor-versioned modern ids still use adaptive.
+        assert!(anthropic_adaptive("claude-sonnet-4.6"));
+        assert!(anthropic_adaptive("claude-sonnet-4-6"));
+        assert!(anthropic_adaptive("anthropic/claude-sonnet-5"));
+    }
+
+    #[test]
+    fn effort_models_under_the_anthropic_wire_use_adaptive_thinking() {
+        let provider = Provider::builtin("anthropic").unwrap();
+        let s = support(&["low", "medium", "high", "max"], Some((1024, 32_000)), false);
+        assert_eq!(
+            thinking_levels(&s, &provider, "claude-sonnet-4-6"),
+            vec!["off", "low", "medium", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn toggle_models_offer_a_switch_wherever_they_sit() {
+        let s = support(&[], None, true);
+        let openrouter = Provider::builtin("openrouter").unwrap();
+        assert_eq!(
+            thinking_levels(&s, &openrouter, "anthropic/claude-sonnet-4.5"),
+            vec!["off", "high"]
+        );
+        // A plain OpenAI-compatible endpoint has no parameter for a bare
+        // toggle, so it advertises no level at all.
+        let openai = Provider::builtin("openai").unwrap();
+        assert_eq!(thinking_levels(&s, &openai, "some-model"), vec!["off"]);
+    }
+
+    #[test]
+    fn clamp_walks_up_then_down_like_pi() {
+        let levels = ["off", "high"];
+        assert_eq!(clamp_thinking(&levels, "medium"), "high");
+        assert_eq!(clamp_thinking(&levels, "minimal"), "high");
+        assert_eq!(clamp_thinking(&levels, "off"), "off");
+        // Nothing at or above: the walk falls back downward.
+        let levels = ["off", "minimal"];
+        assert_eq!(clamp_thinking(&levels, "max"), "minimal");
+        // An unparsable request lands on the first level.
+        assert_eq!(clamp_thinking(&levels, "bogus"), "off");
+    }
+
+    #[test]
+    fn models_dev_reasoning_options_are_parsed() {
+        let effort = json!({
+            "reasoning": true,
+            "limit": {"output": 64000},
+            "reasoning_options": [
+                {"type": "effort", "values": ["low", "medium", "high", "max"]},
+                {"type": "budget_tokens", "min": 1024, "max": 32768}
+            ]
+        });
+        let s = ThinkingSupport::from_model(&effort).unwrap();
+        assert!(s.known && s.reasoning);
+        assert_eq!(s.effort, vec!["low", "medium", "high", "max"]);
+        assert_eq!(s.budget_min, Some(1024));
+        assert_eq!(s.budget_max, Some(32768));
+        // A budget entry that only sets min still gets the output cap as max.
+        let budget = json!({
+            "reasoning": true,
+            "limit": {"output": 8192},
+            "reasoning_options": [{"type": "budget_tokens", "min": 512}]
+        });
+        let s = ThinkingSupport::from_model(&budget).unwrap();
+        assert_eq!(s.budget_min, Some(512));
+        assert_eq!(s.budget_max, Some(8191));
+        // A toggle-only model, and an explicit non-reasoning one.
+        let toggle = json!({"reasoning": true, "reasoning_options": [{"type": "toggle"}]});
+        let s = ThinkingSupport::from_model(&toggle).unwrap();
+        assert!(s.toggle && s.effort.is_empty());
+        let none = ThinkingSupport::from_model(&json!({"reasoning": false})).unwrap();
+        assert!(none.known && !none.reasoning);
+        // No verdict at all: unknown, not non-reasoning.
+        assert!(ThinkingSupport::from_model(&json!({})).is_none());
+    }
+
+    #[test]
+    fn providers_json_thinking_parses_effort_toggle_budget_and_off() {
+        let effort = ThinkingSupport::from_config(
+            &json!({"effort": ["none", "low", "high"]}),
+            Wire::OpenAi,
+        )
+        .unwrap();
+        assert!(effort.known && effort.reasoning);
+        assert_eq!(effort.effort, vec!["none", "low", "high"]);
+
+        // A plain OpenAI-compatible endpoint has no `enabled` field, so a
+        // toggle is represented by the two effort values local servers accept.
+        let toggle = ThinkingSupport::from_config(&json!({"toggle": true}), Wire::OpenAi).unwrap();
+        assert_eq!(toggle.effort, vec!["none", "high"]);
+        assert!(!toggle.toggle);
+        let anthropic_toggle =
+            ThinkingSupport::from_config(&json!({"toggle": true}), Wire::Anthropic).unwrap();
+        assert!(anthropic_toggle.toggle && anthropic_toggle.effort.is_empty());
+
+        let budget = ThinkingSupport::from_config(
+            &json!({"budget": {"min": 512, "max": 8192}}),
+            Wire::Anthropic,
+        )
+        .unwrap();
+        assert_eq!(budget.budget_min, Some(512));
+        assert_eq!(budget.budget_max, Some(8192));
+
+        // The block itself is a declaration: false means known non-reasoning.
+        let none = ThinkingSupport::from_config(&json!(false), Wire::OpenAi).unwrap();
+        assert!(none.known && !none.reasoning);
+        assert!(ThinkingSupport::from_config(&json!("high"), Wire::OpenAi).is_none());
+    }
+
+    #[test]
+    fn explicit_provider_thinking_is_a_per_model_override() {
+        let text = r#"{
+            "vllm": {
+                "url": "http://localhost:8000/v1",
+                "thinking": {"effort": ["low", "high"]},
+                "models": {
+                    "qwen3": {"thinking": {"toggle": true}},
+                    "other": {},
+                    "text-only": {"thinking": false}
+                }
+            }
+        }"#;
+        let file = parse_providers(text).unwrap().remove(0);
+        let provider = Provider::local("vllm").unwrap();
+        let store = crate::store::Store::memory();
+        store.save_provider_thinking(
+            "vllm",
+            &[("qwen3".into(), support(&["minimal"], None, false))],
+        );
+
+        // The model entry wins over both the provider default and discovery.
+        let s = thinking_support_from(Some(&store), &provider, "qwen3", Some(&file));
+        assert_eq!(s.effort, vec!["none", "high"]);
+        assert!(!s.toggle);
+        // The provider default covers every other discovered model.
+        let s = thinking_support_from(Some(&store), &provider, "other", Some(&file));
+        assert_eq!(s.effort, vec!["low", "high"]);
+        // A model entry can explicitly opt out of the provider default.
+        let s = thinking_support_from(Some(&store), &provider, "text-only", Some(&file));
+        assert!(s.known && !s.reasoning);
+        // Without the file, the discovered row remains the answer.
+        let s = thinking_support_from(Some(&store), &provider, "qwen3", None);
+        assert_eq!(s.effort, vec!["minimal"]);
+    }
+
+    #[test]
+    fn local_toggle_declarations_send_reasoning_effort() {
+        let mut cfg = test_cfg(Provider::custom("llamacpp", Wire::OpenAi));
+        cfg.model = "qwen3".into();
+        cfg.thinking_support =
+            ThinkingSupport::from_config(&json!({"toggle": true}), Wire::OpenAi).unwrap();
+
+        cfg.thinking = "high".into();
+        let (_, body, _) = openai_request(&cfg, &[Msg::User("hi".into())], &builtin_tools(), "");
+        assert_eq!(body["reasoning_effort"], "high");
+        cfg.thinking = "off".into();
+        let (_, body, _) = openai_request(&cfg, &[Msg::User("hi".into())], &builtin_tools(), "");
+        assert_eq!(body["reasoning_effort"], "none");
     }
 
     #[test]
@@ -1396,6 +2188,9 @@ mod tests {
             base_url: "http://localhost".into(),
             api_key: "k".into(),
             thinking: "medium".into(),
+            // Unknown until a test says otherwise: the requests then carry no
+            // reasoning field, which is what a model without metadata gets.
+            thinking_support: ThinkingSupport::default(),
             timeout: std::time::Duration::from_secs(1),
             max_output: 100,
             jobs: 1,
@@ -1448,24 +2243,125 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_request_includes_thinking_budget() {
+    fn anthropic_45_gets_a_thinking_budget() {
         let mut cfg = test_cfg(Provider::builtin("anthropic").unwrap());
+        cfg.model = "claude-sonnet-4-5".into();
+        cfg.thinking_support = support(&[], Some((1024, 32_000)), false);
         let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 10240);
+        // Room for the answer on top of the budget.
+        assert_eq!(body["max_tokens"], 8192 + 10240);
         cfg.thinking = "off".into();
         let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
         assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn anthropic_46_gets_adaptive_thinking_with_effort() {
+        let mut cfg = test_cfg(Provider::builtin("anthropic").unwrap());
+        cfg.model = "claude-sonnet-4-6".into();
+        cfg.thinking_support = support(&["low", "medium", "high", "max"], Some((1024, 32_000)), false);
+        let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert!(body.get("max_tokens").is_some(), "adaptive keeps the answer budget");
+        // A level this model does not document is not translated into another:
+        // nothing is sent for it.
+        cfg.thinking = "xhigh".into();
+        let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        // `off` is omission for a model that defaults to thinking off.
+        cfg.thinking = "off".into();
+        let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn anthropic_toggle_models_send_an_explicit_disable() {
+        let mut cfg = test_cfg(Provider::builtin("anthropic").unwrap());
+        cfg.model = "claude-sonnet-5".into();
+        cfg.thinking = "off".into();
+        cfg.thinking_support = support(
+            &["low", "medium", "high", "xhigh", "max"],
+            None,
+            true,
+        );
+        let (_, body, _) = anthropic_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+        assert!(
+            body.get("max_tokens").is_some(),
+            "the answer budget still applies when thinking is off"
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_sends_no_reasoning_fields() {
+        // The level is set, but the model has no metadata yet: the request
+        // must stay plain rather than guess a parameter the API may reject.
+        let cfg = test_cfg(Provider::builtin("openai").unwrap());
+        assert!(!cfg.thinking_support.known);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
     fn openai_request_passes_effort_through() {
-        let cfg = test_cfg(Provider::builtin("openai").unwrap());
+        let mut cfg = test_cfg(Provider::builtin("openai").unwrap());
+        cfg.thinking_support = support(&["low", "medium", "high"], None, false);
         let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
         assert_eq!(body["reasoning_effort"], "medium");
-        let mut cfg = test_cfg(Provider::builtin("tokenharbor").unwrap());
         cfg.thinking = "off".into();
         let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
-        assert!(body.get("reasoning_effort").is_none());
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "off omits the field when the model does not document `none`"
+        );
+        // When `none` is documented, off is sent as that value.
+        cfg.thinking_support = support(&["none", "low", "medium", "high"], None, false);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn openrouter_gets_the_unified_reasoning_object() {
+        let mut cfg = test_cfg(Provider::builtin("openrouter").unwrap());
+        cfg.thinking_support = support(&["none", "low", "medium", "high"], None, false);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert!(body.get("reasoning_effort").is_none(), "OpenRouter uses the object, not the field");
+        cfg.thinking = "off".into();
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["effort"], "none");
+        // A model that documents efforts but not `none` still gets an explicit
+        // off switch instead of silently falling back to its default.
+        cfg.thinking_support = support(&["low", "medium", "high"], None, false);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["enabled"], false);
+        // A model that documents no controls at all has nothing to switch.
+        cfg.thinking_support = support(&[], None, false);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert!(body.get("reasoning").is_none());
+        // A budget-only model speaks max_tokens.
+        cfg.thinking = "medium".into();
+        cfg.thinking_support = support(&[], Some((1024, 32_000)), false);
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["max_tokens"], 10240);
+        // A toggle-only model speaks enabled.
+        cfg.thinking_support = support(&[], None, true);
+        cfg.thinking = "high".into();
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["enabled"], true);
+        cfg.thinking = "off".into();
+        let (_, body, _) = openai_request(&cfg, &[], &builtin_tools(), "");
+        assert_eq!(body["reasoning"]["enabled"], false);
     }
 
     #[test]
@@ -1672,19 +2568,37 @@ mod catalog_tests {
     #[test]
     fn models_dev_yields_bare_ids_with_context_windows() {
         let base = serve_once(
-            r#"{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":200000,"output":64000}}}},
+            r#"{"anthropic":{"models":{
+                    "claude-sonnet-4-5":{"limit":{"context":200000,"output":64000},"reasoning":true,
+                        "reasoning_options":[{"type":"effort","values":["low","medium","high"]}]},
+                    "claude-3-5-haiku":{"limit":{"context":200000},"reasoning":false}}},
                 "openrouter":{"models":{"anthropic/claude-sonnet-4.5":{"limit":{"context":1000000}}}},
                 "broken":{"models":{"x":{"limit":{"context":0}}},"nomodels":1}}"#,
         );
         let client = Client::new().unwrap();
-        let map = client.fetch_model_contexts_from(&base);
+        let catalog = client.fetch_model_catalog_from(&base).expect("catalog parses");
         assert_eq!(
-            map,
+            catalog.contexts,
             vec![
                 ("anthropic/claude-sonnet-4.5".to_string(), 1_000_000),
+                ("claude-3-5-haiku".to_string(), 200_000),
                 ("claude-sonnet-4-5".to_string(), 200_000)
             ]
         );
+        // Reasoning rows land per provider, so /thinking can resolve a model
+        // through the provider that actually serves it.
+        let (provider, _, s) = catalog
+            .thinking
+            .iter()
+            .find(|(p, m, _)| p == "anthropic" && m == "claude-sonnet-4-5")
+            .expect("sonnet reasoning row");
+        assert_eq!(provider, "anthropic");
+        assert!(s.reasoning);
+        assert_eq!(s.effort, vec!["low", "medium", "high"]);
+        assert!(catalog
+            .thinking
+            .iter()
+            .any(|(p, m, s)| p == "anthropic" && m == "claude-3-5-haiku" && !s.reasoning));
     }
 
     #[test]
@@ -1751,8 +2665,11 @@ mod catalog_tests {
     #[test]
     fn the_provider_file_reads_models_in_both_common_shapes() {
         let array = r#"{"x":{"url":"http://localhost:1/v1",
-            "models":["a",{"id":"b"},{"name":"c"}]}}"#;
-        assert_eq!(parse_providers(array).unwrap()[0].models, vec!["a", "b", "c"]);
+            "models":["a",{"id":"b","thinking":{"effort":["low"]}},{"name":"c"}]}}"#;
+        let p = parse_providers(array).unwrap();
+        assert_eq!(p[0].models, vec!["a", "b", "c"]);
+        assert_eq!(p[0].model_thinking[0].0, "b");
+        assert_eq!(p[0].model_thinking[0].1.effort, vec!["low"]);
         let object = r#"{"x":{"url":"http://localhost:1/v1",
             "models":{"a":{},"b":{"name":"B"}}}}"#;
         assert_eq!(parse_providers(object).unwrap()[0].models, vec!["a", "b"]);
@@ -1813,13 +2730,34 @@ mod catalog_live_tests {
     #[ignore = "needs the network; run explicitly with --ignored"]
     fn the_real_models_dev_catalog_parses_and_is_populous() {
         let client = Client::new().unwrap();
-        let map = client.fetch_model_contexts();
-        assert!(map.len() > 3000, "only {} models parsed", map.len());
+        let catalog = client.fetch_model_catalog().expect("models.dev reachable");
+        assert!(catalog.contexts.len() > 3000, "only {} models parsed", catalog.contexts.len());
         // The same id is published with several windows (200k first-party,
         // 198k bedrock, 1M on the 1m tier); the merge keeps the smallest, so
         // the figure errs low like the heuristic it replaces.
-        let sonnet = map.iter().find(|(id, _)| id == "claude-sonnet-4-5");
+        let sonnet = catalog.contexts.iter().find(|(id, _)| id == "claude-sonnet-4-5");
         let c = sonnet.expect("sonnet missing from models.dev").1;
         assert!(c <= 200_000 && c > 0, "sonnet window {c}");
+        // Reasoning metadata is the point of the catalog: it must be there for
+        // the models the ladder is built from.
+        assert!(
+            catalog.thinking.len() > 1000,
+            "only {} reasoning rows parsed",
+            catalog.thinking.len()
+        );
+        assert!(
+            catalog
+                .thinking
+                .iter()
+                .any(|(p, m, s)| p == "anthropic" && m == "claude-sonnet-4-6" && !s.effort.is_empty()),
+            "sonnet 4.6 should publish effort values"
+        );
+        assert!(
+            catalog
+                .thinking
+                .iter()
+                .any(|(p, m, s)| p == "openai" && m == "gpt-4.1" && !s.reasoning),
+            "gpt-4.1 should be explicitly non-reasoning"
+        );
     }
 }

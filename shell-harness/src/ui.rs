@@ -1348,6 +1348,7 @@ fn completion_items(
     current_model: &str,
     catalog: &[(String, String)],
     providers: &[(String, String)],
+    thinking: &[&'static str],
 ) -> Option<(usize, Vec<Item>)> {
     let chars: Vec<char> = buffer.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -1386,7 +1387,7 @@ fn completion_items(
             .collect()
     } else if head.trim_end() == "/thinking" {
         let frag = word.to_ascii_lowercase();
-        crate::config::THINKING_LEVELS
+        thinking
             .iter()
             .filter(|l| l.starts_with(frag.as_str()))
             .map(|l| Item { name: l.to_string(), desc: "thinking level".to_string() })
@@ -1402,6 +1403,7 @@ fn exact_hit(
     cursor: usize,
     catalog: &[(String, String)],
     providers: &[(String, String)],
+    thinking: &[&'static str],
 ) -> bool {
     let chars: Vec<char> = buffer.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -1417,7 +1419,7 @@ fn exact_hit(
         match head.trim_end() {
             "/provider" => providers.iter().any(|(p, _)| *p == word),
             "/model" => catalog.iter().any(|(_, id)| *id == word),
-            "/thinking" => crate::config::THINKING_LEVELS.iter().any(|l| *l == word),
+            "/thinking" => thinking.iter().any(|l| *l == word),
             _ => false,
         }
     }
@@ -1923,6 +1925,8 @@ pub(crate) struct Input<'h> {
     current: String,
     catalog: Vec<(String, String)>,
     providers: Vec<(String, String)>,
+    /// The levels the current model documents; `/thinking` completes from it.
+    thinking: Vec<&'static str>,
     hist: &'h mut Vec<String>,
     hpos: Option<usize>,
     draft: String,
@@ -1941,6 +1945,7 @@ impl<'h> Input<'h> {
             current: String::new(),
             catalog: Vec::new(),
             providers: Vec::new(),
+            thinking: Vec::new(),
             hist,
             hpos: None,
             draft: String::new(),
@@ -1955,11 +1960,13 @@ impl<'h> Input<'h> {
         current: &str,
         catalog: &[(String, String)],
         providers: &[(String, String)],
+        thinking: &[&'static str],
     ) {
         self.provider = provider.to_string();
         self.current = current.to_string();
         self.catalog = catalog.to_vec();
         self.providers = providers.to_vec();
+        self.thinking = thinking.to_vec();
     }
 
     pub fn text(&self) -> &str {
@@ -2003,6 +2010,7 @@ impl<'h> Input<'h> {
             &self.current,
             &self.catalog,
             &self.providers,
+            &self.thinking,
         ) {
             Some((st, items)) => {
                 self.mstart = st;
@@ -2193,7 +2201,7 @@ impl<'h> Input<'h> {
                 // Menu open: Enter picks the highlighted row, unless the word
                 // is already exactly what is highlighted — then it submits.
                 if !self.menu.is_empty()
-                    && !exact_hit(&self.buf, self.cursor, &self.catalog, &self.providers)
+                    && !exact_hit(&self.buf, self.cursor, &self.catalog, &self.providers, &self.thinking)
                 {
                     self.accept_sel();
                     Outcome::Redraw
@@ -2282,7 +2290,13 @@ impl Reader {
         let mut input = Input::new(&mut self.hist);
         // Context first: `set_text` recomputes the menu, and the menu needs
         // the catalog to have anything to show.
-        input.set_context(cfg.provider.name(), &cfg.model, catalog, providers);
+        input.set_context(
+            cfg.provider.name(),
+            &cfg.model,
+            catalog,
+            providers,
+            &cfg.thinking_choices(),
+        );
         if let Some(text) = prefill {
             input.set_text(text);
         }
@@ -2406,7 +2420,7 @@ mod tests {
     fn the_provider_menu_includes_custom_entries() {
         let mut all = providers();
         all.push(("ollama".into(), "custom openai API, no key needed".into()));
-        let (_, items) = completion_items("/provider o", 11, "anthropic", "", &[], &all).unwrap();
+        let (_, items) = completion_items("/provider o", 11, "anthropic", "", &[], &all, crate::config::THINKING_LEVELS).unwrap();
         let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["openai", "openrouter", "ollama"]);
     }
@@ -2415,13 +2429,13 @@ mod tests {
     fn provider_subcommands_are_not_hijacked_by_a_lookalike_name() {
         let mut all = providers();
         all.push(("adder".into(), "custom openai API".into()));
-        assert!(completion_items("/provider add", 13, "anthropic", "", &[], &all).is_none());
-        assert!(completion_items("/provider remove", 16, "anthropic", "", &[], &all).is_none());
+        assert!(completion_items("/provider add", 13, "anthropic", "", &[], &all, crate::config::THINKING_LEVELS).is_none());
+        assert!(completion_items("/provider remove", 16, "anthropic", "", &[], &all, crate::config::THINKING_LEVELS).is_none());
     }
 
     #[test]
     fn slash_lists_every_command() {
-        let (start, items) = completion_items("/", 1, "anthropic", "", &[], &providers()).unwrap();
+        let (start, items) = completion_items("/", 1, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).unwrap();
         assert_eq!(start, 0);
         assert_eq!(items.len(), crate::commands::COMMANDS.len());
     }
@@ -2429,44 +2443,75 @@ mod tests {
     #[test]
     fn partial_filters() {
         // `/mcp` shares the /m prefix with `/model`, so both must be offered.
-        let (_, items) = completion_items("/m", 2, "anthropic", "", &[], &providers()).unwrap();
+        let (_, items) = completion_items("/m", 2, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| i.name.starts_with("/m")));
     }
 
     #[test]
     fn plain_text_has_no_menu() {
-        assert!(completion_items("hello", 5, "anthropic", "", &[], &providers()).is_none());
-        assert!(completion_items("", 0, "anthropic", "", &[], &providers()).is_none());
+        assert!(completion_items("hello", 5, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).is_none());
+        assert!(completion_items("", 0, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).is_none());
     }
 
     #[test]
     fn provider_second_word_completes() {
-        let (start, items) = completion_items("/provider an", 12, "anthropic", "", &[], &providers()).unwrap();
+        let (start, items) = completion_items("/provider an", 12, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).unwrap();
         assert_eq!(start, 10);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "anthropic");
     }
 
     #[test]
-    fn thinking_second_word_completes() {
-        let (start, items) = completion_items("/thinking h", 11, "anthropic", "", &[], &providers()).unwrap();
+    fn thinking_second_word_completes_only_the_model_levels() {
+        // The menu is built from what the current model documents, so a model
+        // that reasons in low/high does not offer `max`.
+        let levels: &[&str] = &["off", "low", "high"];
+        let (start, items) = completion_items(
+            "/thinking h",
+            11,
+            "anthropic",
+            "",
+            &[],
+            &providers(),
+            levels,
+        )
+        .unwrap();
         assert_eq!(start, 10);
         let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["high"]);
-        let (_, items) = completion_items("/thinking ", 10, "anthropic", "", &[], &providers()).unwrap();
-        assert_eq!(items.len(), crate::config::THINKING_LEVELS.len());
+        let (_, items) = completion_items(
+            "/thinking ",
+            10,
+            "anthropic",
+            "",
+            &[],
+            &providers(),
+            levels,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(completion_items(
+            "/thinking m",
+            11,
+            "anthropic",
+            "",
+            &[],
+            &providers(),
+            levels
+        )
+        .is_none());
     }
 
     #[test]
     fn provider_bare_lists_all() {
-        let (_, items) = completion_items("/provider ", 10, "anthropic", "", &[], &providers()).unwrap();
+        let (_, items) = completion_items("/provider ", 10, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).unwrap();
         assert_eq!(items.len(), crate::commands::PROVIDERS.len());
     }
 
     #[test]
     fn unknown_second_word_has_no_menu() {
-        assert!(completion_items("/model xyz", 10, "anthropic", "", &[], &providers()).is_none());
+        assert!(completion_items("/model xyz", 10, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).is_none());
     }
 
     fn catalog() -> Vec<(String, String)> {
@@ -2480,24 +2525,45 @@ mod tests {
 
     #[test]
     fn model_search_matches_substring() {
-        let (_, items) =
-            completion_items("/model gro", 11, "openrouter", "openai/gpt-4.1", &catalog(), &providers())
-                .unwrap();
+        let (_, items) = completion_items(
+            "/model gro",
+            11,
+            "openrouter",
+            "openai/gpt-4.1",
+            &catalog(),
+            &providers(),
+            crate::config::THINKING_LEVELS,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "x-ai/grok-4");
     }
 
     #[test]
     fn model_search_is_case_insensitive_and_marks_current() {
-        let (_, items) =
-            completion_items("/model SONNET", 13, "openrouter", "openai/gpt-4.1", &catalog(), &providers())
-                .unwrap();
+        let (_, items) = completion_items(
+            "/model SONNET",
+            13,
+            "openrouter",
+            "openai/gpt-4.1",
+            &catalog(),
+            &providers(),
+            crate::config::THINKING_LEVELS,
+        )
+        .unwrap();
         // Matches across connected providers, not just the current one.
         let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["anthropic/claude-sonnet-4.5", "claude-sonnet-4-5"]);
-        let (_, items) =
-            completion_items("/model ", 7, "openrouter", "openai/gpt-4.1", &catalog(), &providers())
-                .unwrap();
+        let (_, items) = completion_items(
+            "/model ",
+            7,
+            "openrouter",
+            "openai/gpt-4.1",
+            &catalog(),
+            &providers(),
+            crate::config::THINKING_LEVELS,
+        )
+        .unwrap();
         assert_eq!(items.len(), 4);
         assert!(items.iter().any(|i| i.name == "openai/gpt-4.1" && i.desc == "openrouter, current"));
     }
@@ -2506,7 +2572,7 @@ mod tests {
     fn model_menu_flows_to_submit() {
         let mut h = Vec::new();
         let mut inp = Input::new(&mut h);
-        inp.set_context("openrouter", "openai/gpt-4.1", &catalog(), &providers());
+        inp.set_context("openrouter", "openai/gpt-4.1", &catalog(), &providers(), crate::config::THINKING_LEVELS);
         type_str(&mut inp, "/model gro");
         assert_eq!(inp.menu().len(), 1);
         assert_eq!(inp.key(Key::Enter), Outcome::Redraw);
@@ -2535,7 +2601,7 @@ mod tests {
     fn set_text_opens_the_menu() {
         let mut h = Vec::new();
         let mut inp = Input::new(&mut h);
-        inp.set_context("openrouter", "openai/gpt-4.1", &catalog(), &providers());
+        inp.set_context("openrouter", "openai/gpt-4.1", &catalog(), &providers(), crate::config::THINKING_LEVELS);
         inp.set_text("/model ");
         assert_eq!(inp.menu().len(), 4);
         assert_eq!(inp.text(), "/model ");
@@ -2729,7 +2795,7 @@ mod tests {
 
     #[test]
     fn frame_wipes_stale_rows() {
-        let (_, items) = completion_items("/", 1, "anthropic", "", &[], &providers()).unwrap();
+        let (_, items) = completion_items("/", 1, "anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS).unwrap();
         assert_eq!(items.len(), crate::commands::COMMANDS.len());
         // Rows drawn for a menu: the window plus a footer when it overflows.
         let rows_for = |n: usize| 1 + n.min(MENU_ROWS) + usize::from(n > MENU_ROWS);
@@ -2933,7 +2999,7 @@ mod tests {
     fn provider_flow_submits_full_command() {
         let mut h = Vec::new();
         let mut inp = Input::new(&mut h);
-        inp.set_context("anthropic", "", &[], &providers());
+        inp.set_context("anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS);
         type_str(&mut inp, "/provider openrouter");
         assert_eq!(inp.key(Key::Enter), Outcome::Submit);
         assert_eq!(inp.text(), "/provider openrouter");
@@ -2943,7 +3009,7 @@ mod tests {
     fn enter_picks_highlighted_provider() {
         let mut h = Vec::new();
         let mut inp = Input::new(&mut h);
-        inp.set_context("anthropic", "", &[], &providers());
+        inp.set_context("anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS);
         type_str(&mut inp, "/provider ");
         // Empty fragment + Enter completes the highlighted row instead of
         // submitting the bare prefix.
@@ -2956,7 +3022,7 @@ mod tests {
     fn arrows_then_enter_picks_openrouter() {
         let mut h = Vec::new();
         let mut inp = Input::new(&mut h);
-        inp.set_context("anthropic", "", &[], &providers());
+        inp.set_context("anthropic", "", &[], &providers(), crate::config::THINKING_LEVELS);
         type_str(&mut inp, "/provider ");
         inp.key(Key::Down);
         inp.key(Key::Down);

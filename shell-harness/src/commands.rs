@@ -35,9 +35,6 @@ pub enum Action {
     Skills,
     /// Every configured MCP server, with its connection verdict.
     Mcp,
-    /// Autocompact: `Some(arg)` sets or clears (`off`) the threshold, already
-    /// validated; `None` reports the current setting and pressure.
-    Autocompact(Option<String>),
 }
 
 /// Single source of truth for every slash command: name + one-line description.
@@ -48,9 +45,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/status", "show provider, model, thinking and key status"),
     ("/provider", "pick a provider; custom endpoints live in providers.json"),
     ("/model", "pick from every configured provider, or set one id"),
-    ("/thinking", "show or set thinking effort (off|minimal|low|medium|high|xhigh|max)"),
+    ("/thinking", "show or set thinking effort (levels depend on the model)"),
     ("/compact", "summarize history to free context"),
-    ("/autocompact", "compact automatically at N% of the context window (/autocompact 80, off)"),
     ("/skills", "list the skills this session can load"),
     ("/mcp", "list MCP servers, their state and their tools"),
     ("/resume", "list this directory's sessions or resume one by id (/resume all)"),
@@ -292,6 +288,9 @@ pub fn handle(line: &str, cfg: &mut Config, store: &crate::store::Store) -> Acti
     if !line.starts_with('/') {
         return Action::NotCommand;
     }
+    // Capabilities may have landed since the last prompt. Resolve them before
+    // commands inspect or change the level.
+    cfg.refresh_thinking(store);
     let (name, arg) = match line.split_once(char::is_whitespace) {
         Some((n, a)) => (n, a.trim()),
         None => (line, ""),
@@ -308,21 +307,6 @@ pub fn handle(line: &str, cfg: &mut Config, store: &crate::store::Store) -> Acti
         "/thinking" => Action::Thinking(arg.to_string()),
         "/compact" => Action::Compact(arg.to_string()),
         "/mcp" => Action::Mcp,
-        "/autocompact" => {
-            if arg.is_empty() {
-                Action::Autocompact(None)
-            } else {
-                let good = arg.eq_ignore_ascii_case("off")
-                    || arg.parse::<u8>().map(|p| (1..=99).contains(&p)).unwrap_or(false);
-                if good {
-                    Action::Autocompact(Some(arg.to_string()))
-                } else {
-                    Action::Problem(format!(
-                        "usage: /autocompact <1-99|off>, got {arg:?}"
-                    ))
-                }
-            }
-        }
         "/resume" => {
             if arg.is_empty() {
                 Action::Resume(None)
@@ -382,15 +366,32 @@ fn mask(key: &str) -> String {
     format!("••••{tail}")
 }
 
+/// The current thinking level described against what the model actually
+/// documents. `requested` is the level that was asked for (stored or typed);
+/// when the two differ, the clamp is named instead of happening silently.
+/// Shared by `/status` and the messages that report a provider/model change.
+pub fn thinking_note(cfg: &Config, requested: &str) -> String {
+    if !cfg.thinking_support.known {
+        return format!(
+            "{} (model not in the catalog: no reasoning parameters are sent)",
+            cfg.thinking
+        );
+    }
+    if !cfg.thinking_support.reasoning {
+        return format!("{} (this model does not reason)", cfg.thinking);
+    }
+    let levels = cfg.thinking_levels().join("|");
+    if cfg.thinking != requested {
+        format!("{} (clamped from {requested}: this model supports {levels})", cfg.thinking)
+    } else {
+        format!("{} (this model supports {levels})", cfg.thinking)
+    }
+}
+
 pub fn status(cfg: &Config) -> String {
-    // A level wider than the API is reported here as well as where it is set,
-    // because the status line is where someone looks to find out what is sent.
-    let thinking = match crate::provider::effort_note(&cfg.thinking) {
-        Some(note) if cfg.provider.wire() != crate::config::Wire::Anthropic => {
-            format!("{} ({note})", cfg.thinking)
-        }
-        _ => cfg.thinking.clone(),
-    };
+    // A level wider than the model is never silently kept: the line shows the
+    // level a request will actually use, plus the levels this model accepts.
+    let thinking = thinking_note(cfg, &cfg.thinking);
     let key = if cfg.api_key.is_empty() {
         if cfg.provider.requires_key() { "(not set)" } else { "(not needed)" }.to_string()
     } else {
@@ -489,25 +490,59 @@ fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action 
         Ok(o) => o,
         Err(e) => return Action::Problem(e),
     };
+    // The model the switch will land on: an inline `model=`, else the one
+    // stored for this provider, else its default. The thinking level belongs
+    // to that model, so an inline `thinking=` is judged against it before
+    // anything changes. A model with no metadata yet accepts any canonical
+    // level; the level is kept and no reasoning parameter is sent until the
+    // catalog arrives.
+    let target_model = opts
+        .model
+        .clone()
+        .or_else(|| {
+            crate::provider::state(provider.name(), store)
+                .map(|s| s.model)
+                .filter(|m| !m.is_empty())
+        })
+        .unwrap_or_else(|| provider.default_model().to_string());
+    let requested = opts
+        .thinking
+        .clone()
+        .or_else(|| store.get_model_thinking(provider.name(), &target_model))
+        .unwrap_or_else(|| "medium".to_string());
+    if let Some(t) = &opts.thinking {
+        let support = crate::provider::thinking_support(Some(store), &provider, &target_model);
+        if support.known {
+            let levels = crate::provider::thinking_levels(&support, &provider, &target_model);
+            if !levels.contains(&t.as_str()) {
+                return Action::Problem(format!(
+                    "thinking level '{t}' is not supported by {target_model}. This model supports: {}",
+                    levels.join(", ")
+                ));
+            }
+        }
+    }
     // An inline `key=` is the key for this switch. Otherwise a built-in always
     // asks, even when one is already stored: that is how the old key is
     // replaced instead of being kept forever.
     let key_given = opts.key.as_deref().is_some_and(|k| !k.is_empty());
     match cfg.switch_provider(&provider, store) {
         Ok(()) => {
-            if let Some(m) = opts.model {
-                cfg.model = m;
-            }
+            cfg.model = target_model;
             if let Some(u) = opts.url {
                 cfg.base_url = normalize_url(&u);
             }
             if let Some(k) = opts.key {
                 cfg.api_key = k;
             }
-            if let Some(t) = opts.thinking {
-                cfg.thinking = t.clone();
-                store.set_thinking(provider.name(), &t);
+            // Restore what this target model had stored, or apply the inline
+            // level. `requested` is kept before clamping so the reply can say
+            // when the model changed it.
+            cfg.thinking = requested.clone();
+            if let Some(t) = &opts.thinking {
+                store.set_model_thinking(provider.name(), &cfg.model, t);
             }
+            cfg.refresh_thinking(store);
             persist(store, cfg);
             let custom = if provider.is_custom() {
                 format!(" (custom, {} API)", provider.wire().as_str())
@@ -515,10 +550,11 @@ fn provider(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action 
                 String::new()
             };
             let msg = format!(
-                "switched to {}{custom}, model {}, url {}",
+                "switched to {}{custom}, model {}, url {}; thinking {}",
                 provider.name(),
                 if cfg.model.is_empty() { "(not set: /model)" } else { &cfg.model },
-                cfg.base_url
+                cfg.base_url,
+                thinking_note(cfg, &requested)
             );
             if provider.requires_key() && !key_given {
                 return Action::NeedKey { msg, env: provider.key_env() };
@@ -583,20 +619,27 @@ fn model(arg: &str, cfg: &mut Config, store: &crate::store::Store) -> Action {
         if owner != cfg.provider.name() {
             if let Some(p) = Provider::resolve(owner, store) {
                 if cfg.switch_provider(&p, store).is_ok() {
-                    cfg.model = arg.to_string();
+                    let requested = cfg.select_model(arg.to_string(), store);
                     persist(store, cfg);
                     return Action::Changed(format!(
-                        "switched to {}, model {}",
+                        "switched to {}, model {}; thinking {}",
                         p.name(),
-                        cfg.model
+                        cfg.model,
+                        thinking_note(cfg, &requested)
                     ));
                 }
             }
         }
     }
-    cfg.model = arg.to_string();
+    // The level belongs to the model being set: restore its own choice, then
+    // resolve and clamp against its capabilities.
+    let requested = cfg.select_model(arg.to_string(), store);
     persist(store, cfg);
-    Action::Changed(format!("model set to {}", cfg.model))
+    Action::Changed(format!(
+        "model set to {}; thinking {}",
+        cfg.model,
+        thinking_note(cfg, &requested)
+    ))
 }
 
 /// `/rewind [n]`: how many user turns back to truncate to. Pure, tested.
@@ -885,6 +928,7 @@ mod tests {
             base_url: "http://localhost".into(),
             api_key: String::new(),
             thinking: "medium".into(),
+            thinking_support: Default::default(),
             timeout: std::time::Duration::from_secs(1),
             max_output: 100,
             jobs: 1,
@@ -942,7 +986,137 @@ mod tests {
             assert_eq!(cfg.base_url, "https://example.com");
             assert_eq!(cfg.model, "m1");
             assert_eq!(cfg.thinking, "low");
-            assert_eq!(store.get_thinking("openrouter").as_deref(), Some("low"));
+            assert_eq!(
+                store.get_model_thinking("openrouter", "m1").as_deref(),
+                Some("low"),
+                "the level is remembered for the model it was chosen on"
+            );
+        });
+    }
+
+    #[test]
+    fn provider_thinking_is_judged_against_the_target_models_capabilities() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            // models.dev says this model reasons only in low/medium/high.
+            store.save_provider_thinking(
+                "openrouter",
+                &[(
+                    "vendor/m1".to_string(),
+                    crate::provider::ThinkingSupport {
+                        known: true,
+                        reasoning: true,
+                        effort: vec!["low".into(), "medium".into(), "high".into()],
+                        ..Default::default()
+                    },
+                )],
+            );
+            let mut cfg = test_cfg();
+            match handle(
+                "/provider openrouter model=vendor/m1 thinking=max",
+                &mut cfg,
+                &store,
+            ) {
+                Action::Problem(m) => {
+                    assert!(m.contains("not supported"), "{m}");
+                    assert!(m.contains("low, medium, high"), "the model's levels are named: {m}");
+                }
+                _ => panic!("expected rejection"),
+            }
+            assert_eq!(
+                cfg.provider,
+                Provider::builtin("anthropic").unwrap(),
+                "a rejected level must not half-apply the switch"
+            );
+            // A level the model does document is applied and stored per model.
+            match handle(
+                "/provider openrouter key=k model=vendor/m1 thinking=high",
+                &mut cfg,
+                &store,
+            ) {
+                Action::Changed(m) => assert!(m.contains("thinking high"), "{m}"),
+                _ => panic!("expected a provider switch"),
+            }
+            assert_eq!(cfg.thinking, "high");
+            assert_eq!(
+                store.get_model_thinking("openrouter", "vendor/m1").as_deref(),
+                Some("high")
+            );
+        });
+    }
+
+    #[test]
+    fn a_stored_level_is_clamped_when_the_model_supports_only_toggle() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            store.set_model_thinking("openrouter", "vendor/switch", "medium");
+            store.save_provider_thinking(
+                "openrouter",
+                &[(
+                    "vendor/switch".to_string(),
+                    crate::provider::ThinkingSupport {
+                        known: true,
+                        reasoning: true,
+                        toggle: true,
+                        ..Default::default()
+                    },
+                )],
+            );
+            let mut cfg = test_cfg();
+            match handle(
+                "/provider openrouter key=k model=vendor/switch",
+                &mut cfg,
+                &store,
+            ) {
+                Action::Changed(m) => {
+                    assert!(m.contains("thinking high"), "{m}");
+                    assert!(m.contains("clamped from medium"), "the clamp is named: {m}");
+                }
+                _ => panic!("expected the model to be set"),
+            }
+            assert_eq!(cfg.thinking, "high");
+        });
+    }
+
+    #[test]
+    fn switching_models_restores_each_models_own_level() {
+        with_clean_env(|| {
+            let store = Store::memory();
+            let support = |levels: &[&str]| crate::provider::ThinkingSupport {
+                known: true,
+                reasoning: true,
+                effort: levels.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
+            store.save_provider_thinking(
+                "openrouter",
+                &[
+                    ("vendor/a".to_string(), support(&["low", "medium", "high"])),
+                    ("vendor/b".to_string(), support(&["low", "medium", "high"])),
+                ],
+            );
+            store.set_model_thinking("openrouter", "vendor/a", "high");
+            store.set_model_thinking("openrouter", "vendor/b", "low");
+
+            let mut cfg = test_cfg();
+            // The inline model owns the level, not whatever the provider's
+            // previously stored model was using.
+            match handle(
+                "/provider openrouter key=k model=vendor/a",
+                &mut cfg,
+                &store,
+            ) {
+                Action::Changed(m) => assert!(m.contains("thinking high"), "{m}"),
+                _ => panic!("expected a provider switch"),
+            }
+            assert_eq!(cfg.thinking, "high");
+
+            match handle("/model vendor/b", &mut cfg, &store) {
+                Action::Changed(m) => assert!(m.contains("thinking low"), "{m}"),
+                _ => panic!("expected the model to be set"),
+            }
+            assert_eq!(cfg.model, "vendor/b");
+            assert_eq!(cfg.thinking, "low", "the other model's level must not leak over");
         });
     }
 

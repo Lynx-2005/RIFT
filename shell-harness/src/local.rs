@@ -10,7 +10,7 @@
 //! the last successful inventory, and a successful empty list clears it so a
 //! stopped server stops offering stale models.
 
-use crate::provider::Client;
+use crate::provider::{Client, ThinkingSupport};
 use crate::store::Store;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -59,6 +59,7 @@ pub fn discover_all(store: &Store, client: &Client) {
         if found.ids.is_empty() {
             store.clear_models(name);
             store.clear_contexts(name);
+            store.save_provider_thinking(name, &[]);
         } else {
             store.save_models(name, &found.ids);
             if found.contexts.is_empty() {
@@ -66,6 +67,7 @@ pub fn discover_all(store: &Store, client: &Client) {
             } else {
                 store.save_contexts(name, &found.contexts);
             }
+            store.save_provider_thinking(name, &found.thinking);
         }
     }
 }
@@ -80,6 +82,8 @@ struct Target {
 struct Discovered {
     ids: Vec<String>,
     contexts: Vec<(String, u64)>,
+    /// Reasoning support per model, when the runtime described it.
+    thinking: Vec<(String, ThinkingSupport)>,
 }
 
 /// A local runtime is probed only when it has an endpoint and no explicit
@@ -166,6 +170,7 @@ fn discover_ollama(target: &Target, client: &Client) -> Option<Discovered> {
             if let Some(context) = info.context {
                 found.contexts.push((id.clone(), context));
             }
+            found.thinking.push((id.clone(), info.thinking.clone()));
             found.ids.push(id);
         }
     }
@@ -173,6 +178,9 @@ fn discover_ollama(target: &Target, client: &Client) -> Option<Discovered> {
     found.ids.dedup();
     found
         .contexts
+        .retain(|(id, _)| found.ids.binary_search(id).is_ok());
+    found
+        .thinking
         .retain(|(id, _)| found.ids.binary_search(id).is_ok());
     Some(found)
 }
@@ -207,6 +215,10 @@ fn discover_vllm(target: &Target, client: &Client) -> Option<Discovered> {
 struct ShowInfo {
     completion: bool,
     context: Option<u64>,
+    /// What this model says about reasoning. Always `known`: the show response
+    /// either described thinking controls, listed the thinking capability, or
+    /// had no thinking capability at all.
+    thinking: crate::provider::ThinkingSupport,
 }
 
 type ShowCache = Mutex<HashMap<String, (String, ShowInfo)>>;
@@ -307,17 +319,20 @@ fn ollama_summaries(body: &Value) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-/// Ollama `/api/show`: capabilities gate chat models, and the architecture's
-/// `<family>.context_length` entry supplies the context window.
+/// Ollama `/api/show`: capabilities gate chat models, the architecture's
+/// `<family>.context_length` entry supplies the context window, and the
+/// `thinking` descriptor names the levels a thinking model accepts.
 fn ollama_show_info(body: &Value) -> ShowInfo {
-    let completion = body
-        .get("capabilities")
-        .and_then(Value::as_array)
-        .is_some_and(|capabilities| {
-            capabilities
-                .iter()
-                .any(|capability| capability.as_str() == Some("completion"))
-        });
+    let capability = |name: &str| {
+        body.get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(name))
+            })
+    };
+    let completion = capability("completion");
     let context = body
         .get("model_info")
         .and_then(Value::as_object)
@@ -330,9 +345,81 @@ fn ollama_show_info(body: &Value) -> ShowInfo {
                 }
             })
         });
+    let thinking = if capability("thinking") {
+        ollama_thinking(body).unwrap_or_else(legacy_thinking)
+    } else {
+        ThinkingSupport {
+            known: true,
+            reasoning: false,
+            ..Default::default()
+        }
+    };
     ShowInfo {
         completion,
         context,
+        thinking,
+    }
+}
+
+/// Ollama `/api/show` `thinking`: `{values: [true|false|"low"|...], default}`.
+/// Named values map onto the canonical ladder; a plain boolean switch becomes
+/// one "on" level, the same way every other toggle-capable model is shown.
+/// `none` is the documented off switch on the OpenAI-compatible endpoint, so
+/// it is offered whenever any level is. A descriptor whose default is not one
+/// of its own values is not trusted.
+fn ollama_thinking(body: &Value) -> Option<ThinkingSupport> {
+    let descriptor = body.get("thinking")?;
+    let values = descriptor.get("values")?.as_array()?;
+    let default = descriptor.get("default")?;
+    if values.is_empty() || !values.iter().any(|value| value == default) {
+        return None;
+    }
+    let named: Vec<String> = values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| crate::config::THINKING_LEVELS.contains(name))
+        .map(str::to_string)
+        .collect();
+    let on = values.iter().any(|value| value.as_bool() == Some(true));
+    if named.is_empty() && !on {
+        // The descriptor exists but offers no way to enable thinking.
+        return Some(ThinkingSupport {
+            known: true,
+            reasoning: false,
+            ..Default::default()
+        });
+    }
+    let mut support = ThinkingSupport {
+        known: true,
+        reasoning: true,
+        effort: if named.is_empty() {
+            // A boolean switch has no graded levels: one on level, presented
+            // like every other toggle-capable model.
+            vec!["high".to_string()]
+        } else {
+            named
+        },
+        ..Default::default()
+    };
+    support.effort.push("none".to_string());
+    Some(support)
+}
+
+/// A thinking-capable model whose `/api/show` predates the `thinking`
+/// descriptor. The OpenAI-compatible endpoint still resolves the canonical
+/// names (aliasing `minimal` and `xhigh`), so the whole ladder is expressible
+/// and `none` disables.
+fn legacy_thinking() -> ThinkingSupport {
+    ThinkingSupport {
+        known: true,
+        reasoning: true,
+        effort: crate::config::THINKING_LEVELS
+            .iter()
+            .skip(1)
+            .map(|level| level.to_string())
+            .chain(["none".to_string()])
+            .collect(),
+        ..Default::default()
     }
 }
 
@@ -534,6 +621,10 @@ mod tests {
         let info = ollama_show_info(&chat);
         assert!(info.completion);
         assert_eq!(info.context, Some(131072));
+        assert!(
+            info.thinking.known && !info.thinking.reasoning,
+            "a model without the thinking capability is explicitly non-reasoning"
+        );
 
         let embedding = json!({
             "capabilities": ["embedding"],
@@ -541,6 +632,63 @@ mod tests {
         });
         assert!(!ollama_show_info(&embedding).completion);
         assert!(!ollama_show_info(&json!({})).completion);
+    }
+
+    #[test]
+    fn ollama_thinking_reads_the_models_own_levels() {
+        // The server names the levels it accepts: only those become /thinking
+        // choices; `none` rides along as the documented off switch.
+        let named = json!({
+            "capabilities": ["completion", "thinking"],
+            "thinking": {
+                "values": ["low", "medium", "high", "max"],
+                "default": "medium"
+            }
+        });
+        let info = ollama_show_info(&named);
+        assert!(info.thinking.reasoning);
+        assert_eq!(
+            info.thinking.effort,
+            vec!["low", "medium", "high", "max", "none"]
+        );
+
+        // A plain boolean switch has one on level, like any toggle model.
+        let toggle = json!({
+            "capabilities": ["completion", "thinking"],
+            "thinking": {"values": [true, false], "default": true}
+        });
+        let info = ollama_show_info(&toggle);
+        assert!(info.thinking.reasoning);
+        assert_eq!(info.thinking.effort, vec!["high", "none"]);
+
+        // A descriptor that cannot be trusted falls back to the capability,
+        // whose endpoint still resolves the canonical aliases.
+        let broken = json!({
+            "capabilities": ["completion", "thinking"],
+            "thinking": {"values": ["low", "high"], "default": "medium"}
+        });
+        let info = ollama_show_info(&broken);
+        assert!(info.thinking.reasoning);
+        assert!(
+            info.thinking.effort.len() > 3,
+            "the legacy ladder keeps thinking usable: {:?}",
+            info.thinking.effort
+        );
+
+        // A thinking capability with no descriptor (older server) does the
+        // same rather than hiding the model's ability.
+        let legacy = json!({"capabilities": ["completion", "thinking"]});
+        let info = ollama_show_info(&legacy);
+        assert!(info.thinking.reasoning);
+        assert!(info.thinking.effort.contains(&"high".to_string()));
+
+        // A descriptor offering no way to enable thinking is not reasoning.
+        let off_only = json!({
+            "capabilities": ["completion", "thinking"],
+            "thinking": {"values": [false], "default": false}
+        });
+        let info = ollama_show_info(&off_only);
+        assert!(info.thinking.known && !info.thinking.reasoning);
     }
 
     #[test]
@@ -604,7 +752,8 @@ mod tests {
                     .to_string();
                 if model == "chat:7b" {
                     json!({
-                        "capabilities": ["completion", "tools"],
+                        "capabilities": ["completion", "tools", "thinking"],
+                        "thinking": {"values": ["low", "medium", "high"], "default": "medium"},
                         "model_info": {"llama.context_length": 32768}
                     })
                     .to_string()
@@ -628,6 +777,11 @@ mod tests {
         server.join().unwrap();
         assert_eq!(found.ids, vec!["chat:7b"]);
         assert_eq!(found.contexts, vec![("chat:7b".to_string(), 32768)]);
+        assert_eq!(found.thinking.len(), 1);
+        let (model, support) = &found.thinking[0];
+        assert_eq!(model, "chat:7b");
+        assert!(support.reasoning);
+        assert_eq!(support.effort, vec!["low", "medium", "high", "none"]);
     }
 
     #[test]

@@ -188,8 +188,7 @@ fn sections_of(v: &View, ctx: ContextFigures) -> Vec<(&'static str, Vec<Line>)> 
         usage.push(Line::new("cache hit", "none yet", ""));
         usage.push(Line::new("context", "none yet", "no model call made"));
     } else {
-        // How much of the window the last request filled: the same figure
-        // autocompact acts on, so a surprise compaction can be checked here.
+        // How much of the window the last request filled.
         usage.push(match ctx {
             Some((used, window)) => Line::new(
                 "context",
@@ -486,8 +485,7 @@ mod tests {
 
     #[test]
     fn the_context_line_states_the_window_and_the_share_used() {
-        // The same two numbers autocompact compares: the share is what a
-        // compaction threshold acts on, so it must be readable at a glance.
+        // The window and the share used: both must be readable at a glance.
         let sections = sections_of(&sample(3, 12000, 9000, 2331), Some((150_000, 200_000)));
         let out = render(&sections, &|s| s.to_string());
         assert!(out.contains("150,000 of ~200,000 (75%)"), "{out}");

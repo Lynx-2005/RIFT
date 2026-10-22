@@ -300,8 +300,9 @@ pub fn local_default_url(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Pi-style effort ladder. Levels pass through to the provider verbatim
-/// (`reasoning_effort`) or via a budget map (Anthropic); servers clamp.
+/// The canonical effort ladder. A model exposes only the subset its metadata
+/// documents; `off` is the only level for a model that cannot reason (or whose
+/// capabilities have not arrived yet).
 pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Parser, Debug)]
@@ -372,6 +373,10 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub thinking: String,
+    /// What the current model says about reasoning. Refreshed whenever the
+    /// model or provider changes and before every turn, so a catalog that
+    /// lands after startup still takes effect without a restart.
+    pub thinking_support: crate::provider::ThinkingSupport,
     pub timeout: std::time::Duration,
     pub max_output: usize,
     /// Up to this many commands from one reply at once. 0 means all of them.
@@ -405,6 +410,62 @@ mod tests {
         store.set_thinking("openai", "high");
         let cfg = build(&["rift", "--provider", "openai", "--api-key", "k"], &store).unwrap();
         assert_eq!(cfg.thinking, "high");
+    }
+
+    #[test]
+    fn startup_judges_the_level_against_the_models_capabilities() {
+        let store = crate::store::Store::memory();
+        store.save_provider_thinking(
+            "openai",
+            &[(
+                "gpt-5.2".into(),
+                crate::provider::ThinkingSupport {
+                    known: true,
+                    reasoning: true,
+                    effort: vec!["low".into(), "high".into()],
+                    ..Default::default()
+                },
+            )],
+        );
+        store.set_model_thinking("openai", "gpt-5.2", "medium");
+        let args = ["rift", "--provider", "openai", "--api-key", "k", "--model", "gpt-5.2"];
+        let cfg = build(&args, &store).unwrap();
+        assert_eq!(cfg.thinking, "high", "a stored level is clamped, not sent as-is");
+        assert_eq!(cfg.thinking_choices(), vec!["off", "low", "high"]);
+
+        // An explicit level the model does not document is a startup error,
+        // not a silently different request.
+        let err = build(
+            &[
+                "rift",
+                "--provider",
+                "openai",
+                "--api-key",
+                "k",
+                "--model",
+                "gpt-5.2",
+                "--thinking",
+                "max",
+            ],
+            &store,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not supported by gpt-5.2"), "{err}");
+        assert!(err.contains("off, low, high"), "the model's levels are named: {err}");
+
+        // Unknown metadata keeps the choice and offers the whole ladder; no
+        // reasoning field is sent until the catalog arrives.
+        let store = crate::store::Store::memory();
+        store.set_model_thinking("openai", "future-model", "max");
+        let cfg = build(
+            &["rift", "--provider", "openai", "--api-key", "k", "--model", "future-model"],
+            &store,
+        )
+        .unwrap();
+        assert_eq!(cfg.thinking, "max");
+        assert!(!cfg.thinking_support.known);
+        assert_eq!(cfg.thinking_choices(), THINKING_LEVELS);
     }
 
     #[test]
@@ -502,6 +563,12 @@ impl Config {
             base_url: "http://localhost/v1".into(),
             api_key: "k".into(),
             thinking: "medium".into(),
+            thinking_support: crate::provider::ThinkingSupport {
+                known: true,
+                reasoning: true,
+                effort: THINKING_LEVELS.iter().skip(1).map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
             timeout: std::time::Duration::from_secs(1),
             max_output: 1000,
             jobs: 1,
@@ -563,9 +630,16 @@ impl Config {
             Some(p) => p.canonicalize()?,
             None => std::env::current_dir()?,
         };
-        // A flag or env var wins for this run only: the stored level stays put,
-        // and an unknown level is a typo worth stopping for rather than
-        // silently sending something else.
+        let model = cli
+            .model
+            .or_else(|| saved.as_ref().map(|s| s.model.clone()).filter(|m| !m.is_empty()))
+            .unwrap_or_else(|| provider.default_model().to_string());
+        // The level belongs to the model: prefer its own stored choice, then
+        // the old per-provider row. Only levels the model documents survive;
+        // an unknown model keeps the stored level but sends no reasoning
+        // parameters until its metadata arrives.
+        let thinking_support = crate::provider::thinking_support(Some(store), &provider, &model);
+        let levels = crate::provider::thinking_levels(&thinking_support, &provider, &model);
         let thinking = match cli.thinking {
             Some(level) => {
                 if !THINKING_LEVELS.contains(&level.as_str()) {
@@ -574,16 +648,27 @@ impl Config {
                         THINKING_LEVELS.join(", ")
                     );
                 }
+                if thinking_support.known && !levels.contains(&level.as_str()) {
+                    anyhow::bail!(
+                        "thinking level '{level}' is not supported by {model}. This model supports: {}",
+                        levels.join(", ")
+                    );
+                }
                 level
             }
-            None => store
-                .get_thinking(provider.name())
-                .unwrap_or_else(|| "medium".to_string()),
+            None => {
+                let stored = store
+                    .get_model_thinking(provider.name(), &model)
+                    .unwrap_or_else(|| "medium".to_string());
+                if thinking_support.known {
+                    crate::provider::clamp_thinking(&levels, &stored).to_string()
+                } else if THINKING_LEVELS.contains(&stored.as_str()) {
+                    stored
+                } else {
+                    "medium".to_string()
+                }
+            }
         };
-        let model = cli
-            .model
-            .or_else(|| saved.as_ref().map(|s| s.model.clone()).filter(|m| !m.is_empty()))
-            .unwrap_or_else(|| provider.default_model().to_string());
         let base_url = normalize_url(
             &cli.base_url
                 .or_else(|| saved.as_ref().map(|s| s.base_url.clone()).filter(|u| !u.is_empty()))
@@ -595,6 +680,7 @@ impl Config {
             base_url,
             api_key,
             thinking,
+            thinking_support,
             timeout: std::time::Duration::from_secs(cli.timeout),
             max_output: cli.max_output,
             jobs: cli.jobs,
@@ -660,10 +746,60 @@ impl Config {
             .filter(|k| !k.is_empty())
             .or_else(|| provider.env_key())
             .unwrap_or_default();
-        self.thinking = store
-            .get_thinking(provider.name())
-            .unwrap_or_else(|| "medium".to_string());
         self.provider = provider.clone();
+        self.thinking = store
+            .get_model_thinking(provider.name(), &self.model)
+            .unwrap_or_else(|| "medium".to_string());
+        self.refresh_thinking(store);
         Ok(())
+    }
+
+    /// Point the config at another model on the current provider. The level
+    /// belongs to the model, so its stored choice is restored (or the level
+    /// currently showing is kept for a model that has none yet) and then
+    /// clamped to what the new model documents. Returns the level that was
+    /// requested before clamping, so callers can name a clamp in their reply.
+    pub fn select_model(
+        &mut self,
+        model: impl Into<String>,
+        store: &crate::store::Store,
+    ) -> String {
+        self.model = model.into();
+        if let Some(level) = store.get_model_thinking(self.provider.name(), &self.model) {
+            self.thinking = level;
+        }
+        let requested = self.thinking.clone();
+        self.refresh_thinking(store);
+        requested
+    }
+
+    /// Re-read the current model's capabilities and clamp the chosen level to
+    /// what it actually supports. Called after provider/model changes and
+    /// before every turn, so a background catalog refresh is picked up live.
+    pub fn refresh_thinking(&mut self, store: &crate::store::Store) {
+        self.thinking_support =
+            crate::provider::thinking_support(Some(store), &self.provider, &self.model);
+        if self.thinking_support.known {
+            let levels = self.thinking_levels();
+            self.thinking =
+                crate::provider::clamp_thinking(&levels, &self.thinking).to_string();
+        }
+    }
+
+    /// The levels this model documents. A model without metadata (or without
+    /// reasoning) offers only `off`.
+    pub fn thinking_levels(&self) -> Vec<&'static str> {
+        crate::provider::thinking_levels(&self.thinking_support, &self.provider, &self.model)
+    }
+
+    /// The `/thinking` menu. Until the catalog describes this model, the whole
+    /// canonical ladder stays selectable: the choice is retained and applied
+    /// once its capabilities arrive.
+    pub fn thinking_choices(&self) -> Vec<&'static str> {
+        if self.thinking_support.known {
+            self.thinking_levels()
+        } else {
+            THINKING_LEVELS.to_vec()
+        }
     }
 }

@@ -117,6 +117,61 @@ copied into the database: the file stays the source of truth. A malformed file
 is reported at startup, and one invalid entry is skipped without hiding the
 rest.
 
+### Declaring thinking support
+
+vLLM, llama.cpp, and LM Studio do not expose a standard reasoning-capability
+endpoint. Declare it in `providers.json` instead; the block applies to every
+model the entry serves:
+
+```json
+{
+  "vllm": {
+    "url": "http://localhost:8000/v1",
+    "thinking": {
+      "supported": true,
+      "effort": ["none", "low", "medium", "high"]
+    }
+  },
+  "llamacpp": {
+    "url": "http://localhost:8080/v1",
+    "thinking": {
+      "supported": true,
+      "toggle": true
+    }
+  }
+}
+```
+
+A model entry can override the provider-wide block:
+
+```json
+"models": {
+  "qwen3-coder": {
+    "thinking": {
+      "supported": true,
+      "effort": ["none", "low", "medium", "high"]
+    }
+  }
+}
+```
+
+- `supported`: `false` means this model explicitly cannot reason. Omit the
+  whole block to leave the model unknown; it then sends no reasoning fields.
+- `effort`: the levels this endpoint accepts. Include `"none"` if `off` should
+  explicitly disable thinking. On OpenAI-compatible endpoints these become
+  `reasoning_effort` values; vLLM and llama.cpp both accept that field (vLLM
+  enables thinking for `low`/`medium`/`high` and disables it for `none`;
+  llama.cpp passes the value to its chat template).
+- `toggle`: declares an on/off endpoint with no graded effort. On an
+  OpenAI-compatible endpoint this is sent as `none` for off and `high` for on.
+- `budget`: `{"min": ..., "max": ...}` for Anthropic-wire budget control (also
+  used by OpenRouter's unified reasoning object). OpenAI-compatible local
+  servers use `effort` or `toggle`.
+
+Explicit configuration wins over discovery: model entry, then provider entry,
+then Ollama's `/api/show` metadata, then models.dev, then unknown. The file is
+read live, so an edit takes effect on the next request without restarting.
+
 ### Where settings live
 
 Per project, rift reads `.rift/`: skills in `.rift/skills/` and MCP servers in

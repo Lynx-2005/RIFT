@@ -32,7 +32,10 @@ pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
             .cached_models(cfg.provider.name())
             .and_then(|(ids, _)| ids.into_iter().next())
         {
-            cfg.model = model;
+            // Discovery also lands thinking capabilities: the model picked up
+            // from the cache restores its own level instead of the startup
+            // guess for an empty model id.
+            cfg.select_model(model, &store);
         }
     }
     // Both of these are optional extras and neither may stop a session from
@@ -218,21 +221,43 @@ pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
                 }
             }
             Action::Thinking(arg) => {
+                // The level belongs to the model, so capabilities are resolved
+                // first: what is offered (and accepted) is what this model
+                // actually documents, not one ladder for every provider.
+                session.cfg.refresh_thinking(&store);
+                let model = session.cfg.model.clone();
+                let known = session.cfg.thinking_support.known;
+                let levels = session.cfg.thinking_levels();
                 if arg.is_empty() {
-                    ui::info(&format!(
-                        "thinking: {} ({})",
-                        session.cfg.thinking,
-                        config::THINKING_LEVELS.join("|")
-                    ));
-                } else if config::THINKING_LEVELS.contains(&arg.as_str()) {
-                    session.cfg.thinking = arg.clone();
-                    store.set_thinking(session.cfg.provider.name(), &arg);
-                    match crate::provider::effort_note(&arg) {
-                        Some(note) if session.cfg.provider.wire() != config::Wire::Anthropic => {
-                            ui::ok(&format!("thinking set to {arg} ({note})"))
-                        }
-                        _ => ui::ok(&format!("thinking set to {arg}")),
+                    if known {
+                        ui::info(&format!(
+                            "thinking: {} (this model supports {})",
+                            session.cfg.thinking,
+                            levels.join("|")
+                        ));
+                    } else {
+                        ui::info(&format!(
+                            "thinking: {} (model not in the catalog: no reasoning parameters are sent)",
+                            session.cfg.thinking
+                        ));
                     }
+                } else if levels.contains(&arg.as_str())
+                    || (!known && config::THINKING_LEVELS.contains(&arg.as_str()))
+                {
+                    session.cfg.thinking = arg.clone();
+                    store.set_model_thinking(session.cfg.provider.name(), &model, &arg);
+                    if known {
+                        ui::ok(&format!("thinking set to {arg}"));
+                    } else {
+                        ui::ok(&format!(
+                            "thinking set to {arg} (model not in the catalog: reasoning parameters are sent once its capabilities are known)"
+                        ));
+                    }
+                } else if known {
+                    ui::error(&format!(
+                        "thinking level {arg} is not supported by {model}. This model supports: {}",
+                        levels.join("|")
+                    ));
                 } else {
                     ui::error(&format!(
                         "unknown thinking level: {arg} ({})",
@@ -312,8 +337,8 @@ pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
                 }
             }
             Action::Stats => {
-                // The same two numbers autocompact compares, so a compaction
-                // can be checked against what the last request actually used.
+                // What the last request actually used, shown against the
+                // model's context window.
                 let ctx = session
                     .last
                     .lock()
@@ -337,9 +362,6 @@ pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
                     Ok(mut m) => println!("{}", m.status()),
                     Err(_) => ui::error("the MCP connection was lost"),
                 }
-            }
-            Action::Autocompact(arg) => {
-                session.autocompact(arg.as_deref(), &store);
             }
             Action::Message(msg) => ui::info(&msg),
             Action::Problem(msg) => ui::error(&msg),
@@ -427,12 +449,17 @@ pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
     // Local runtimes first: a server that was just started should show up in
     // /model before the slower models.dev download finishes.
     refresh_model_lists(store, client);
-    // Context windows from models.dev land even when no provider list needs a
-    // refresh: the map changes on its own schedule, covers every provider at
-    // once, and costs one keyless request.
-    let dev = client.fetch_model_contexts();
-    if !dev.is_empty() {
-        store.save_contexts("models.dev", &dev);
+    // Context windows and per-model reasoning metadata from models.dev land
+    // even when no provider list needs a refresh: the catalog changes on its
+    // own schedule, covers every provider at once, and costs one keyless
+    // request. The thinking rows are what /thinking resolves levels from.
+    if let Some(dev) = client.fetch_model_catalog() {
+        if !dev.contexts.is_empty() {
+            store.save_contexts("models.dev", &dev.contexts);
+        }
+        if !dev.thinking.is_empty() {
+            store.save_model_thinking(&dev.thinking);
+        }
     }
 }
 
@@ -583,7 +610,7 @@ pub struct Session {
     /// What rides along with the system prompt. Recomputed per turn, because a
     /// skill written while rift is open should be usable in the next turn.
     context: String,
-    /// The most recent request's usage, for autocompact.
+    /// The most recent request's usage, for /stats.
     last: LastUsage,
 }
 
@@ -645,6 +672,17 @@ impl Session {
         ui::turn_begin();
         // A skill added while the session was open is usable now.
         self.context = crate::skills::catalog(&self.cfg.cwd);
+        // Capabilities may have landed with the catalog refresh since the last
+        // turn, or the model may have changed; resolve them and say so when the
+        // stored level no longer fits, instead of sending what the API rejects.
+        let before = self.cfg.thinking.clone();
+        self.cfg.refresh_thinking(store);
+        if self.cfg.thinking != before {
+            ui::info(&format!(
+                "thinking level {before} is not supported by {}; using {}",
+                self.cfg.model, self.cfg.thinking
+            ));
+        }
         let outcome = run_loop(
             &self.cfg,
             &self.client,
@@ -656,7 +694,6 @@ impl Session {
             &self.last,
         );
         ui::turn_close();
-        self.maybe_autocompact(store, session_id);
         // Now that the turn is over, work out what it changed. A rewind then
         // undoes this session's own edits, and leaves alone anything that was
         // already different for other reasons.
@@ -675,84 +712,6 @@ impl Session {
         }
         store.save_messages(session_id, &self.history);
         Ok(())
-    }
-
-    /// Compacts on its own when the stored threshold says so. Called after a
-    /// turn finishes: the last request's prompt usage is the context as the
-    /// model just saw it, and the output it is about to write only grows it.
-    /// Compaction runs here, not mid-turn, so a turn is never torn apart under
-    /// itself; the next request then starts from the summary.
-    fn maybe_autocompact(&mut self, store: &crate::store::Store, session_id: i64) {
-        // A one-shot run exits after its one turn: there is no next request to
-        // protect, so spending a model call on a summary would be pure waste.
-        if self.cfg.prompt.is_some() {
-            return;
-        }
-        let Some(percent) = store.get_autocompact() else { return };
-        let Some(u) = self.last.lock().ok().and_then(|l| *l) else { return };
-        let prompt = u.prompt();
-        let window = crate::provider::context_window_for(
-            Some(store),
-            self.cfg.provider.name(),
-            &self.cfg.model,
-        );
-        if prompt * 100 < window * percent as u64 {
-            return;
-        }
-        ui::warn(&format!(
-            "context at {} of ~{} tokens ({percent}% of the window) - compacting",
-            crate::stats::num(prompt),
-            crate::stats::num(window)
-        ));
-        self.compact("", store, session_id);
-    }
-
-    /// Set, clear or report the autocompact threshold.
-    fn autocompact(&mut self, arg: Option<&str>, store: &crate::store::Store) {
-        match arg {
-            Some("off") => {
-                store.set_autocompact(None);
-                ui::ok("autocompact off");
-            }
-            Some(p) => {
-                let percent: u8 = p.parse().unwrap_or(0);
-                store.set_autocompact(Some(percent));
-                ui::ok(&format!(
-                    "autocompact set: history compacts on its own at {percent}% of the context window"
-                ));
-            }
-            None => match store.get_autocompact() {
-                Some(p) => {
-                    let pressure = self
-                        .last
-                        .lock()
-                        .ok()
-                        .and_then(|l| *l)
-                        .map(|u| u.prompt())
-                        .unwrap_or(0);
-                    let window = crate::provider::context_window_for(
-                        Some(store),
-                        self.cfg.provider.name(),
-                        &self.cfg.model,
-                    );
-                    let at = if pressure > 0 {
-                        format!(
-                            ", last request read {} of ~{} tokens ({}%)",
-                            crate::stats::num(pressure),
-                            crate::stats::num(window),
-                            pressure * 100 / window
-                        )
-                    } else {
-                        ", nothing sent to the model yet".to_string()
-                    };
-                    ui::ok(&format!("autocompact at {p}% of the context window{at}"));
-                }
-                None => ui::info(
-                    "autocompact off. Set a threshold with /autocompact <1-99>, \
-                     e.g. /autocompact 80",
-                ),
-            },
-        }
     }
 
     /// Replace the transcript with a model-written summary. Tool calls in the
@@ -849,7 +808,9 @@ impl Session {
             }
         };
         if self.cfg.switch_provider(&provider, store).is_ok() {
-            self.cfg.model = row.model.clone();
+            // The session names its own model: restore that model's level and
+            // capabilities rather than the provider default's.
+            self.cfg.select_model(row.model.clone(), store);
             persist_session(store, &self.cfg);
         }
         self.history = store.load_messages(id);
@@ -1165,7 +1126,7 @@ fn drive(
         }
         let Turn { text, thinking, calls, usage } = turn;
         // What this request was charged to read is how full the context now
-        // is: the newest fact about the transcript, kept for autocompact.
+        // is: the newest fact about the transcript, kept for /stats.
         if let Ok(mut l) = last.lock() {
             *l = (usage.prompt() > 0).then_some(usage);
         }
