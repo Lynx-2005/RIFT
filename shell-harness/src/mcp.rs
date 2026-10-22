@@ -682,6 +682,10 @@ for line in sys.stdin:
 "#;
 
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Each helper call gets its own config and script files. Two tests that
+    /// share a name must not truncate the file the other one's server is
+    /// starting from: on a loaded Windows runner that read as a stuck connect.
+    static FAKE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn python() -> Option<&'static str> {
         ["python3", "python"].into_iter().find(|cmd| {
@@ -707,9 +711,11 @@ for line in sys.stdin:
         let interpreter = python()?;
         let dir = std::env::temp_dir().join(format!("rift-mcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join(format!("{name}.py"));
+        let seq = FAKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem = format!("{name}-{seq}");
+        let script = dir.join(format!("{stem}.py"));
         std::fs::write(&script, FAKE_SERVER).unwrap();
-        let cfg = dir.join(format!("{name}.json"));
+        let cfg = dir.join(format!("{stem}.json"));
         std::fs::write(
             &cfg,
             json!({"mcpServers": {name: {
