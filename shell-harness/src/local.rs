@@ -358,6 +358,7 @@ fn ollama_show_info(body: &Value) -> ShowInfo {
         }
     };
     thinking.vision = vision;
+    thinking.vision_known = true;
     ShowInfo {
         completion,
         context,
@@ -626,6 +627,7 @@ mod tests {
         let info = ollama_show_info(&chat);
         assert!(info.completion);
         assert_eq!(info.context, Some(131072));
+        assert!(info.vision && info.thinking.vision && info.thinking.vision_known);
         assert!(
             info.thinking.known && !info.thinking.reasoning,
             "a model without the thinking capability is explicitly non-reasoning"
@@ -636,6 +638,7 @@ mod tests {
             "model_info": {"nomic.context_length": 8192}
         });
         assert!(!ollama_show_info(&embedding).completion);
+        assert!(!ollama_show_info(&embedding).vision);
         assert!(!ollama_show_info(&json!({})).completion);
     }
 

@@ -210,6 +210,9 @@ pub struct ThinkingSupport {
     pub toggle: bool,
     /// Whether the model accepts image (vision) inputs.
     pub vision: bool,
+    /// Whether the vision flag above came from real metadata. An old cached
+    /// row without it must not be read as "this model cannot see".
+    pub vision_known: bool,
 }
 
 impl ThinkingSupport {
@@ -230,6 +233,7 @@ impl ThinkingSupport {
             known: true,
             reasoning,
             vision,
+            vision_known: true,
             ..Self::default()
         };
         if !reasoning {
@@ -279,6 +283,7 @@ impl ThinkingSupport {
                     known: true,
                     reasoning,
                     vision,
+                    vision_known: map.contains_key("vision") || map.contains_key("attachment"),
                     ..Self::default()
                 };
                 if !reasoning {
@@ -343,6 +348,8 @@ impl ThinkingSupport {
             "budget_min": self.budget_min,
             "budget_max": self.budget_max,
             "toggle": self.toggle,
+            "vision": self.vision,
+            "vision_known": self.vision_known,
         })
     }
 
@@ -371,6 +378,12 @@ impl ThinkingSupport {
                 .and_then(|v| u32::try_from(v).ok()),
             toggle: v.get("toggle").and_then(Value::as_bool).unwrap_or(false),
             vision: v.get("vision").and_then(Value::as_bool).unwrap_or(false),
+            // Rows written before vision support have no marker: treat them as
+            // unknown so the first turn can still attach a pasted image.
+            vision_known: v
+                .get("vision_known")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -889,6 +902,7 @@ fn merge_support(a: ThinkingSupport, b: ThinkingSupport) -> ThinkingSupport {
         },
         toggle: a.toggle || b.toggle,
         vision: a.vision || b.vision,
+        vision_known: a.vision_known || b.vision_known,
     }
 }
 
@@ -1219,7 +1233,7 @@ fn anthropic_request(
         for m in history {
             match m {
                 Msg::User(t) => {
-                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.known {
+                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.vision_known {
                         crate::provider::extract_image_paths(t)
                     } else {
                         Vec::new()
@@ -1339,7 +1353,7 @@ fn openai_request(
         for m in history {
             match m {
                 Msg::User(t) => {
-                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.known {
+                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.vision_known {
                         crate::provider::extract_image_paths(t)
                     } else {
                         Vec::new()
@@ -1714,12 +1728,14 @@ fn models_from(
             };
             if let Some((_, support)) = thinking.iter_mut().rev().find(|(seen, _)| seen == &id) {
                 support.vision = support.vision || v;
+                support.vision_known = true;
             } else {
                 thinking.push((
                     id.clone(),
                     ThinkingSupport {
                         known: true,
                         vision: v,
+                        vision_known: true,
                         ..Default::default()
                     },
                 ));
@@ -1801,11 +1817,15 @@ pub(crate) fn parse_providers(text: &str) -> Result<Vec<FileProvider>, String> {
                 _ => false,
             };
             match thinking {
-                Some(ref mut t) => t.vision = t.vision || v,
+                Some(ref mut t) => {
+                    t.vision = t.vision || v;
+                    t.vision_known = true;
+                }
                 None => {
                     thinking = Some(ThinkingSupport {
                         known: true,
                         vision: v,
+                        vision_known: true,
                         ..Default::default()
                     })
                 }
@@ -2081,6 +2101,7 @@ mod tests {
             budget_max: budget.map(|(_, max)| max),
             toggle,
             vision: false,
+            vision_known: false,
         }
     }
 
@@ -2179,6 +2200,78 @@ mod tests {
         assert_eq!(s.effort, vec!["low", "high"]);
         assert_eq!(s.budget_min, Some(1024));
         assert_eq!(s.budget_max, Some(4096));
+    }
+
+    #[test]
+    fn vision_survives_the_store_round_trip_and_stale_rows_stay_unknown() {
+        let support = ThinkingSupport {
+            known: true,
+            reasoning: true,
+            vision: true,
+            vision_known: true,
+            ..Default::default()
+        };
+        let back = ThinkingSupport::from_json(&support.to_json()).unwrap();
+        assert!(back.vision && back.vision_known);
+
+        // Rows written by a build without vision carry no marker; they must
+        // read as unknown, not as "this model cannot see".
+        let stale = serde_json::json!({"reasoning": true, "effort": []});
+        let back = ThinkingSupport::from_json(&stale).unwrap();
+        assert!(!back.vision && !back.vision_known);
+    }
+
+    #[test]
+    fn models_dev_attachment_declares_vision() {
+        let audio_only = serde_json::json!({
+            "reasoning": false,
+            "attachment": false,
+            "modalities": {"input": ["text"], "output": ["text"]}
+        });
+        assert!(!ThinkingSupport::from_model(&audio_only).unwrap().vision);
+
+        let image = serde_json::json!({
+            "reasoning": false,
+            "attachment": true,
+            "modalities": {"input": ["text", "image"], "output": ["text"]}
+        });
+        let support = ThinkingSupport::from_model(&image).unwrap();
+        assert!(support.vision && support.vision_known);
+    }
+
+    #[test]
+    fn a_pasted_image_path_becomes_an_openai_image_block() {
+        let path = std::env::temp_dir().join(format!(
+            "rift-vision-test-{}-{}.png",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let mut cfg = crate::config::Config::for_test();
+        cfg.thinking_support.vision = true;
+        cfg.thinking_support.vision_known = true;
+        let msg = Msg::User(format!("see this {} this image", path.display()));
+        let (_, body, _) = openai_request(&cfg, &[msg], &builtin_tools(), "");
+        let content = &body["messages"][1]["content"];
+        assert!(content.is_array(), "image should turn content into blocks");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(
+            content[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+
+        // A model known not to see gets the path as plain text.
+        cfg.thinking_support.vision = false;
+        cfg.thinking_support.vision_known = true;
+        let msg = Msg::User(format!("see this {} this image", path.display()));
+        let (_, body, _) = openai_request(&cfg, &[msg], &builtin_tools(), "");
+        assert!(body["messages"][1]["content"].is_string());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
