@@ -394,8 +394,8 @@ const TAGLINE_FLASH_MS: u64 = 25;
 
 /// The arrival line. Segments fall off the end when the window is narrow,
 /// rather than wrapping: it is a marker, and a wrapped marker reads as damage.
-/// The number of enabled MCP servers is right-aligned on the same row, so the
-/// state is visible without a sentence printed above the wordmark.
+/// The number of enabled MCP servers sits next to the model, so the state is
+/// visible without a sentence printed above the wordmark.
 ///
 /// Returns the raw-mode guard when the tagline animated. The reader holds it
 /// for the first prompt, so keys typed during the reveal are queued in raw
@@ -430,12 +430,12 @@ fn header_line(provider: &str, model: &str, mcp_active: usize, width: usize) -> 
         line.push_str(&paint(DIM, &format!(" - {seg}")));
     }
     // The count is the last thing on the row and the first thing dropped: the
-    // model is what the user chose, while this is a glanceable status.
+    // model is what the user chose, while this is a glanceable status. Keep it
+    // beside the model instead of padding to the terminal edge, which strands
+    // the badge in empty space on a wide window.
     let status = format!("mcp {mcp_active}");
-    let pad = width.saturating_sub(plain.chars().count() + 2 + status.chars().count());
-    if mcp_active > 0 && plain.chars().count() + 2 + status.chars().count() <= width {
-        line.push_str(&" ".repeat(pad + 2));
-        line.push_str(&paint(DIM, "mcp "));
+    if mcp_active > 0 && plain.chars().count() + 3 + status.chars().count() <= width {
+        line.push_str(&paint(DIM, " - mcp "));
         line.push_str(&paint(GREEN, &mcp_active.to_string()));
     }
     line
@@ -3058,11 +3058,15 @@ mod tests {
     }
 
     #[test]
-    fn the_banner_puts_the_mcp_count_on_the_right() {
+    fn the_banner_puts_the_mcp_count_beside_the_model() {
         let line = strip_sgr(&header_line("tokenharbor", "deepseek-v4.1-flash-1017", 1, 80));
-        assert_eq!(line.chars().count(), 80, "{line:?}");
         assert!(line.starts_with("rift - shell agent"), "{line:?}");
-        assert!(line.ends_with("mcp 1"), "{line:?}");
+        assert!(
+            line.ends_with("deepseek-v4.1-flash-1017 - mcp 1"),
+            "{line:?}"
+        );
+        // The badge should not be padded out to the terminal edge.
+        assert!(line.chars().count() < 80, "{line:?}");
         // No servers is quiet rather than a `mcp 0` badge.
         let none = strip_sgr(&header_line("tokenharbor", "deepseek-v4.1-flash-1017", 0, 80));
         assert!(!none.contains("mcp"), "{none:?}");
