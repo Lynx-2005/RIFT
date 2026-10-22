@@ -170,6 +170,9 @@ impl Store {
     }
 
     /// Create or update a custom provider, storing the wire shape it speaks.
+    /// Custom providers now come from `providers.json`; this remains for tests
+    /// that need to simulate a database row written by an older build.
+    #[cfg(test)]
     pub fn save_custom_provider(
         &self,
         name: &str,
@@ -186,19 +189,18 @@ impl Store {
         );
     }
 
-    /// Forget a custom provider: its row, catalog, context windows and level.
+    /// Forget a provider: its row, catalog, context windows, remembered model
+    /// and level.
     pub fn remove_provider(&self, name: &str) {
         for sql in [
             "DELETE FROM providers WHERE name = ?1",
             "DELETE FROM models WHERE provider = ?1",
             "DELETE FROM contexts WHERE provider = ?1",
+            "DELETE FROM session WHERE key = 'thinking:' || ?1",
+            "DELETE FROM session WHERE key = 'model:' || ?1",
         ] {
             let _ = self.conn.execute(sql, params![name]);
         }
-        let _ = self.conn.execute(
-            "DELETE FROM session WHERE key = 'thinking:' || ?1",
-            params![name],
-        );
     }
 
     pub fn active_provider(&self) -> Option<String> {
@@ -278,6 +280,15 @@ impl Store {
         let _ = tx.commit();
     }
 
+    /// Forget every context window learned for a provider. Discovery calls
+    /// this when a server now reports an empty catalog, so numbers from a
+    /// previous model set cannot leak into the next one.
+    pub fn clear_contexts(&self, provider: &str) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM contexts WHERE provider = ?1", params![provider]);
+    }
+
     /// The context window learned for one model, exact id first, then bare id
     /// (OpenRouter ids carry a `vendor/` prefix models.dev's do not).
     pub fn context_of(&self, provider: &str, model: &str) -> Option<u64> {
@@ -337,6 +348,30 @@ impl Store {
             "INSERT INTO session(key, value) VALUES('thinking:' || ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![provider, level],
+        );
+    }
+
+    /// The model last chosen for an auto-discovered runtime. Local providers
+    /// do not get a `providers` row (that would freeze their URL), but the
+    /// choice should still survive a restart if discovery still serves it.
+    pub fn remembered_model(&self, provider: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM session WHERE key = 'model:' || ?1",
+                params![provider],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    pub fn remember_model(&self, provider: &str, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let _ = self.conn.execute(
+            "INSERT INTO session(key, value) VALUES('model:' || ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![provider, model],
         );
     }
 }
@@ -490,24 +525,26 @@ mod tests {
     #[test]
     fn a_custom_provider_keeps_its_kind_and_can_be_removed() {
         let s = Store::memory();
-        s.save_custom_provider("ollama", "openai", "llama3.2", "http://localhost:11434/v1", "");
-        let st = s.provider_state("ollama").unwrap();
+        s.save_custom_provider("localbox", "openai", "llama3.2", "http://127.0.0.1:8787/v1", "");
+        let st = s.provider_state("localbox").unwrap();
         assert_eq!(st.kind, "openai");
         assert_eq!(st.api_key, "", "a local endpoint needs no key");
         // Saving the connection details again must not erase the wire shape.
-        s.save_provider("ollama", "qwen2.5", "http://localhost:11434/v1", "");
-        let st = s.provider_state("ollama").unwrap();
+        s.save_provider("localbox", "qwen2.5", "http://127.0.0.1:8787/v1", "");
+        let st = s.provider_state("localbox").unwrap();
         assert_eq!(st.model, "qwen2.5");
         assert_eq!(st.kind, "openai");
         // Removal takes the row and everything cached about it.
-        s.save_models("ollama", &["qwen2.5".to_string()]);
-        s.save_contexts("ollama", &[("qwen2.5".to_string(), 32_000)]);
-        s.set_thinking("ollama", "low");
-        s.remove_provider("ollama");
-        assert!(s.provider_state("ollama").is_none());
-        assert!(s.cached_models("ollama").is_none());
-        assert!(s.context_of("ollama", "qwen2.5").is_none());
-        assert!(s.get_thinking("ollama").is_none());
+        s.save_models("localbox", &["qwen2.5".to_string()]);
+        s.save_contexts("localbox", &[("qwen2.5".to_string(), 32_000)]);
+        s.set_thinking("localbox", "low");
+        s.remember_model("localbox", "qwen2.5");
+        s.remove_provider("localbox");
+        assert!(s.provider_state("localbox").is_none());
+        assert!(s.cached_models("localbox").is_none());
+        assert!(s.context_of("localbox", "qwen2.5").is_none());
+        assert!(s.get_thinking("localbox").is_none());
+        assert!(s.remembered_model("localbox").is_none());
         assert!(s.provider_rows().is_empty());
     }
 

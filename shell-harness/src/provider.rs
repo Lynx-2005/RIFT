@@ -1148,7 +1148,7 @@ fn local_endpoint(url: &str) -> bool {
 /// filed under. Older builds persisted per-run `--base-url`/`--model` flags, so
 /// an OpenAI row can still be wearing a local server's model.
 fn stale_builtin(provider: &Provider, saved: &crate::store::ProviderState) -> bool {
-    if provider.is_custom() {
+    if !provider.is_builtin() {
         return false;
     }
     if local_endpoint(&saved.base_url) {
@@ -1158,6 +1158,76 @@ fn stale_builtin(provider: &Provider, saved: &crate::store::ProviderState) -> bo
         && file_providers()
             .iter()
             .any(|f| f.name != provider.name() && f.models.contains(&saved.model))
+}
+
+/// A local runtime is visible in `/provider` once discovery has found models,
+/// once the user pinned it in `providers.json`, or when an older build saved a
+/// row for it. A server that has never answered is not offered.
+pub fn local_visible(name: &str, store: &crate::store::Store) -> bool {
+    is_file_backed(name)
+        || store
+            .cached_models(name)
+            .is_some_and(|(ids, _)| !ids.is_empty())
+        || store.provider_state(name).is_some()
+}
+
+/// Connection details for a local runtime. Unlike a hosted provider it always
+/// has an endpoint; only the model may be absent until discovery lands.
+/// `providers.json` wins, then a legacy saved row, then the conventional URL.
+fn local_state(name: &str, provider: &Provider, store: &crate::store::Store) -> crate::store::ProviderState {
+    let file = file_provider(name);
+    let saved = store.provider_state(name);
+    let cached = store.cached_models(name).map(|(ids, _)| ids);
+    // A remembered choice is only valid while the live catalog still serves
+    // it. If the model was removed, fall through to the new first model.
+    let remembered = store
+        .remembered_model(name)
+        .filter(|m| cached.as_ref().is_none_or(|ids| ids.contains(m)));
+    let model = file
+        .as_ref()
+        .map(|f| f.state.model.clone())
+        .filter(|m| !m.is_empty())
+        .or(remembered)
+        // Discovery is the live catalog, so its first model beats a model
+        // frozen into a row by an older build.
+        .or_else(|| cached.and_then(|ids| ids.into_iter().next()))
+        .or_else(|| {
+            saved
+                .as_ref()
+                .map(|s| s.model.clone())
+                .filter(|m| !m.is_empty())
+        })
+        .unwrap_or_default();
+    let base_url = file
+        .as_ref()
+        .map(|f| f.state.base_url.clone())
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            saved
+                .as_ref()
+                .map(|s| s.base_url.clone())
+                .filter(|u| !u.is_empty())
+        })
+        .unwrap_or_else(|| provider.default_url().to_string());
+    let api_key = file
+        .as_ref()
+        .map(|f| f.state.api_key.clone())
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            saved
+                .as_ref()
+                .map(|s| s.api_key.clone())
+                .filter(|k| !k.is_empty())
+        })
+        .or_else(|| provider.env_key())
+        .unwrap_or_default();
+    let kind = file
+        .as_ref()
+        .map(|f| f.state.kind.clone())
+        .or_else(|| saved.as_ref().map(|s| s.kind.clone()))
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| provider.wire().as_str().to_string());
+    crate::store::ProviderState { model, base_url, api_key, kind }
 }
 
 /// A provider's connection details: the file wins over a stored row, so
@@ -1170,6 +1240,9 @@ pub fn state(
     name: &str,
     store: &crate::store::Store,
 ) -> Option<crate::store::ProviderState> {
+    if let Some(provider) = Provider::local(name) {
+        return Some(local_state(name, &provider, store));
+    }
     // A built-in is resolved before the file everywhere else, so a file entry
     // using its name must not shadow it here either.
     let builtin = Provider::builtin(name);
@@ -1701,7 +1774,7 @@ mod catalog_tests {
     #[test]
     fn a_conventional_local_name_can_omit_its_url() {
         let p = parse_providers(r#"{"ollama":{"model":"llama3.2"}}"#).unwrap();
-        assert_eq!(p[0].state.base_url, "http://localhost:11434/v1");
+        assert_eq!(p[0].state.base_url, "http://127.0.0.1:11434/v1");
     }
 
     #[test]

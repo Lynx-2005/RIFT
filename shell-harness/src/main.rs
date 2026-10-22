@@ -3,6 +3,7 @@ mod agent;
 mod checkpoint;
 mod commands;
 mod config;
+mod local;
 mod mcp;
 mod mcp_http;
 mod provider;

@@ -9,11 +9,6 @@ use std::io::BufRead;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
-/// How long one request may take. Tool calls get longer than the handshake
-/// because a server may legitimately work for a while before answering.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// One connected HTTP server.
 pub struct HttpServer {
     http: reqwest::blocking::Client,
@@ -22,17 +17,18 @@ pub struct HttpServer {
     /// The server may hand out a session id on `initialize`; every later
     /// request carries it back in `Mcp-Session-Id`.
     session: Option<String>,
-    /// The negotiated protocol version, sent on every request as
-    /// `MCP-Protocol-Version` once the handshake is done.
-    protocol: String,
+    /// The negotiated protocol version, sent on every request after the
+    /// handshake as `MCP-Protocol-Version`.
+    protocol: Option<String>,
     next_id: u64,
 }
 
 impl HttpServer {
     /// Open a connection: build the client and run the initialize handshake.
-    pub fn connect(url: &str, headers: &[(String, String)]) -> Result<Self> {
+    /// `timeout` bounds the whole startup, the TCP connect included.
+    pub fn connect(url: &str, headers: &[(String, String)], timeout: Duration) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
-            .timeout(CALL_TIMEOUT)
+            .connect_timeout(timeout)
             .build()
             .context("building the HTTP client")?;
         let mut s = HttpServer {
@@ -40,7 +36,7 @@ impl HttpServer {
             url: url.to_string(),
             headers: headers.to_vec(),
             session: None,
-            protocol: "2025-03-26".into(),
+            protocol: None,
             next_id: 0,
         };
         let reply = s.request(
@@ -50,12 +46,17 @@ impl HttpServer {
                 "capabilities": {},
                 "clientInfo": {"name": "rift", "version": env!("CARGO_PKG_VERSION")},
             }),
-            HANDSHAKE_TIMEOUT,
+            timeout,
         )?;
-        if let Some(v) = reply.get("protocolVersion").and_then(|p| p.as_str()) {
-            s.protocol = v.to_string();
-        }
-        s.notify("notifications/initialized")?;
+        // The server names the version it will speak; when it omits one, keep
+        // the revision the request asked for.
+        let agreed = reply
+            .get("protocolVersion")
+            .and_then(|p| p.as_str())
+            .unwrap_or("2025-03-26")
+            .to_string();
+        s.protocol = Some(agreed);
+        s.notify("notifications/initialized", timeout)?;
         Ok(s)
     }
 
@@ -65,7 +66,7 @@ impl HttpServer {
         self.next_id += 1;
         let id = self.next_id;
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let resp = self.post(&body)?;
+        let resp = self.post(&body, timeout)?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().unwrap_or_default();
@@ -94,25 +95,30 @@ impl HttpServer {
     /// Fire a notification: no id, no reply expected. A `202 Accepted` or an
     /// empty body is success; anything else is ignored, because a notification
     /// must not be able to fail the session.
-    fn notify(&mut self, method: &str) -> Result<()> {
+    fn notify(&mut self, method: &str, timeout: Duration) -> Result<()> {
         let body = json!({"jsonrpc": "2.0", "method": method, "params": {}});
-        let _ = self.post(&body)?;
+        let _ = self.post(&body, timeout)?;
         Ok(())
     }
 
-    fn post(&mut self, body: &Value) -> Result<reqwest::blocking::Response> {
+    fn post(&mut self, body: &Value, timeout: Duration) -> Result<reqwest::blocking::Response> {
         // The streamable spec: a client must say it can take either reply
-        // shape, and servers check.
+        // shape, and servers check. The timeout bounds this request alone, so
+        // one slow server cannot ride on a client-wide default.
         let mut req = self
             .http
             .post(&self.url)
             .header("Accept", "application/json, text/event-stream")
+            .timeout(timeout)
             .json(body);
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
         if let Some(s) = &self.session {
             req = req.header("Mcp-Session-Id", s);
+        }
+        if let Some(p) = &self.protocol {
+            req = req.header("MCP-Protocol-Version", p);
         }
         let resp = req.send().context(format!("POST {} failed", self.url))?;
         // A streamable server names the session in the response headers; the

@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
+pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
     ui::quiet_motion(!cfg.spinner);
     if cfg.print_system {
         println!("{}", crate::provider::system(&cfg, &crate::skills::catalog(&cfg.cwd)));
@@ -23,12 +23,33 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
         ui::warn(&problem);
     }
     let client = Client::new()?;
+    // A local runtime has no default model: its catalog is the default. When
+    // this is the first run (or the cache was cleared), discover once before
+    // the first request so `rift --provider ollama` is usable immediately.
+    if cfg.provider.is_local() && cfg.model.is_empty() {
+        crate::local::discover_all(&store, &client);
+        if let Some(model) = store
+            .cached_models(cfg.provider.name())
+            .and_then(|(ids, _)| ids.into_iter().next())
+        {
+            cfg.model = model;
+        }
+    }
     // Both of these are optional extras and neither may stop a session from
     // opening: a skill directory that is unreadable and a server that will not
     // start are both reported, then left behind.
     let tools = Tools::connect(&cfg.cwd);
-    for note in tools.notes() {
-        ui::info(note);
+    for note in tools.take_notes() {
+        ui::info(&note);
+    }
+    // A one-shot run has no later turn to pick up a server that was still
+    // connecting, so give the initial connections a bounded head start.
+    // Interactive sessions wait inside their first turn instead.
+    if cfg.prompt.is_some() {
+        tools.wait_ready(Duration::from_secs(5));
+        for note in tools.take_notes() {
+            ui::info(&note);
+        }
     }
     let mut session = Session::new(cfg.clone(), client, tools);
     persist_session(&store, &session.cfg);
@@ -49,6 +70,9 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
     // rebuilds the menu from the cache on every prompt, so fresh rows appear
     // as soon as the fetch lands.
     spawn_catalog_refresh();
+    // Local servers change independently of rift (a model is pulled, a server
+    // starts or stops), so they are re-probed for the life of the session.
+    spawn_local_discovery();
 
     if let Some(prompt) = cfg.prompt.clone() {
         // One-shot: nothing can be typed mid-turn, so the queues stay empty.
@@ -64,6 +88,11 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
     let work = WhileWorking::new();
     let mut prefill: Option<String> = None;
     loop {
+        // Servers that landed while the prompt sat idle are announced here;
+        // the connection itself never blocked the reader.
+        for note in session.tools.take_notes() {
+            ui::info(&note);
+        }
         let next = match work.typed.take() {
             Some(line) => Some(line),
             None => {
@@ -127,12 +156,13 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
                 if catalog.is_empty() {
                     let configured = commands::provider_candidates(&store, session.cfg.provider.name());
                     ui::info(&format!(
-                        "no models yet. Configured providers:\n  {}\nSet a key with /provider <name>, or add a custom endpoint with /provider add <name> url=<url>",
+                        "no models yet. Configured providers:\n  {}\nSet a key with /provider <name>, start a local server (Ollama, LM Studio, vLLM), or declare a custom endpoint in {}",
                         configured
                             .iter()
                             .map(|(n, d)| format!("{n} ({d})"))
                             .collect::<Vec<_>>()
-                            .join("\n  ")
+                            .join("\n  "),
+                        config::providers_path().display()
                     ));
                 } else {
                     // Refresh stale lists without holding the prompt.
@@ -301,7 +331,7 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
             Action::Mcp => {
                 let m = session.tools.mcp.lock();
                 match m {
-                    Ok(m) => println!("{}", m.status()),
+                    Ok(mut m) => println!("{}", m.status()),
                     Err(_) => ui::error("the MCP connection was lost"),
                 }
             }
@@ -313,6 +343,9 @@ pub fn run(cfg: Config, store: crate::store::Store) -> Result<()> {
             Action::NotCommand => {
                 if let Err(e) = session.turn(line, &store, session_id, &work) {
                     ui::error(&format!("{e:#}"));
+                }
+                for note in session.tools.take_notes() {
+                    ui::info(&note);
                 }
             }
         }
@@ -346,7 +379,9 @@ fn persist_session(store: &crate::store::Store, cfg: &Config) {
             .filter(|k| !k.is_empty())
             .unwrap_or_default();
     }
-    if !crate::provider::is_file_backed(cfg.provider.name()) {
+    if cfg.provider.is_local() {
+        store.remember_model(cfg.provider.name(), &model);
+    } else if !crate::provider::is_file_backed(cfg.provider.name()) {
         store.save_provider(cfg.provider.name(), &model, &url, &key);
     }
     store.set_active(cfg.provider.name());
@@ -363,12 +398,30 @@ pub(crate) fn spawn_catalog_refresh() {
     });
 }
 
+/// Re-probe the local runtimes for the life of the session. This is a single
+/// long-lived thread: `/provider` changes must not start another loop every
+/// time. The first round comes from `spawn_catalog_refresh`, so this one waits
+/// before its first pass.
+pub(crate) fn spawn_local_discovery() {
+    if cfg!(test) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Ok(store) = crate::store::Store::open() else { return };
+        let Ok(client) = Client::new() else { return };
+        loop {
+            std::thread::sleep(Duration::from_secs(crate::local::REFRESH_SECS));
+            crate::local::discover_all(&store, &client);
+        }
+    });
+}
+
 /// Refresh stale model catalogs for connected providers (Anthropic has no
 /// list API, so it always uses the static list). Safe to run on a background
 /// thread while the user is typing: every write goes through the row lock,
 /// and a failed fetch is reported rather than silently shrinking the menu.
 pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
-    // Provider lists first: a server that was just started should show up in
+    // Local runtimes first: a server that was just started should show up in
     // /model before the slower models.dev download finishes.
     refresh_model_lists(store, client);
     // Context windows from models.dev land even when no provider list needs a
@@ -384,13 +437,17 @@ pub(crate) fn refresh_catalogs(store: &crate::store::Store, client: &Client) {
 /// The interactive `/model` path calls this when it has nothing cached: the
 /// menu needs model ids, not context windows.
 pub(crate) fn refresh_model_lists(store: &crate::store::Store, client: &Client) {
+    // Local runtimes answer through their own native metadata APIs (and are
+    // refreshed by their own thread), so they do not use the generic `/models`
+    // path below.
+    crate::local::discover_all(store, client);
     // Built-ins with a key, plus every custom endpoint: a local server with no
     // key is still worth asking for its model list.
     let need: Vec<(String, String, String)> = crate::commands::known_providers(store)
         .into_iter()
         .filter_map(|p| {
             let name = p.name();
-            if name == "anthropic" || store.models_fresh(name) {
+            if name == "anthropic" || p.is_local() || store.models_fresh(name) {
                 return None;
             }
             // A file entry that lists its own models is already complete: no
@@ -550,6 +607,15 @@ impl Session {
         work: &WhileWorking,
     ) -> Result<()> {
         let first = self.history.is_empty();
+        if first {
+            // Fast MCP servers get a moment to land so the first prompt sees
+            // their tools; slower ones join a later round instead of holding
+            // the session back.
+            self.tools.wait_first_turn(Duration::from_millis(1500));
+            for note in self.tools.take_notes() {
+                ui::info(&note);
+            }
+        }
         self.history.push(Msg::User(input.to_string()));
         if first {
             let t: String = input.chars().take(60).collect();
@@ -833,33 +899,63 @@ enum LoopEnd {
 #[derive(Clone)]
 pub struct Tools {
     mcp: Arc<Mutex<crate::mcp::Manager>>,
-    notes: Vec<String>,
-    specs: Vec<crate::provider::ToolSpec>,
+    /// Cleared on the first turn: the one-time grace that lets fast MCP
+    /// servers land before the first request is built.
+    first_turn: Arc<AtomicBool>,
 }
 
 impl Tools {
-    /// Connect every configured MCP server. Never fails.
+    /// Start connecting every configured MCP server. Returns immediately:
+    /// servers finish in the background and join `specs()` as they land.
     pub fn connect(cwd: &std::path::Path) -> Self {
         let mcp = crate::mcp::Manager::connect(cwd);
-        let specs = mcp.tool_specs();
-        let notes = mcp.notes().to_vec();
-        Tools { mcp: Arc::new(Mutex::new(mcp)), notes, specs }
+        Tools {
+            mcp: Arc::new(Mutex::new(mcp)),
+            first_turn: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     /// Just the harness's own tools, without MCP: what tests use.
     #[cfg(test)]
     pub fn builtin_only() -> Self {
-        let mcp = crate::mcp::Manager::none();
-        let specs = mcp.tool_specs();
-        Tools { mcp: Arc::new(Mutex::new(mcp)), notes: Vec::new(), specs }
+        Tools {
+            mcp: Arc::new(Mutex::new(crate::mcp::Manager::none())),
+            first_turn: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    pub fn notes(&self) -> &[String] {
-        &self.notes
+    /// Connection notes added since the last call, including servers that just
+    /// landed. The caller prints them at a quiet point.
+    pub fn take_notes(&self) -> Vec<String> {
+        match self.mcp.lock() {
+            Ok(mut m) => m.take_notes(),
+            Err(_) => Vec::new(),
+        }
     }
 
-    pub fn specs(&self) -> &[crate::provider::ToolSpec] {
-        &self.specs
+    /// The current tool list: the harness's own plus every server connected so
+    /// far. Rebuilt per model round, so a server that lands mid-turn joins the
+    /// next one.
+    pub fn specs(&self) -> Vec<crate::provider::ToolSpec> {
+        match self.mcp.lock() {
+            Ok(mut m) => m.tool_specs(),
+            Err(_) => crate::provider::builtin_tools(),
+        }
+    }
+
+    /// Wait for every pending server, bounded by `timeout`.
+    pub fn wait_ready(&self, timeout: std::time::Duration) {
+        if let Ok(mut m) = self.mcp.lock() {
+            m.wait_ready(timeout);
+        }
+    }
+
+    /// The first turn waits briefly for the initial connections; later turns
+    /// never do.
+    pub fn wait_first_turn(&self, timeout: std::time::Duration) {
+        if self.first_turn.swap(false, Ordering::Relaxed) {
+            self.wait_ready(timeout);
+        }
     }
 
     /// Run one non-shell call. Returns the text to hand back to the model.
@@ -942,7 +1038,7 @@ fn drive(
         let client2 = client.clone();
         let hist2 = hist.clone();
         let worker_cancel = cancel.clone();
-        let specs = tools.specs().to_vec();
+        let specs = tools.specs();
         let context = context.to_string();
         std::thread::spawn(move || {
             let res = client2.complete_streaming(&cfg2, &hist2, &specs, &context, |c| {

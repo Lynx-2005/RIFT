@@ -99,19 +99,24 @@ impl Wire {
     }
 }
 
+/// Model servers that run on this machine and are discovered automatically.
+/// They are not "custom" providers: no registration is needed, and their model
+/// catalogs come from the server itself (see `local.rs`).
+pub const LOCAL_PROVIDERS: &[&str] = &["ollama", "lmstudio", "vllm"];
+
 /// A provider is an id plus the wire shape behind it. The four built-ins carry
-/// their own defaults; everything else is a custom endpoint the user saved.
-/// Custom providers are first-class: they appear in `/provider`, their models
-/// join the same `/model` catalog, and they persist like the built-ins.
+/// their own defaults; the local runtimes are probed on this machine; and
+/// everything else is a custom endpoint declared in `providers.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provider {
     name: String,
     wire: Wire,
     builtin: bool,
+    local: bool,
 }
 
 impl Provider {
-    /// One of the four providers with defaults baked in.
+    /// One of the four hosted providers with defaults baked in.
     pub fn builtin(name: &str) -> Option<Self> {
         let name = name.trim().to_ascii_lowercase();
         let wire = match name.as_str() {
@@ -119,15 +124,26 @@ impl Provider {
             "openai" | "tokenharbor" | "openrouter" => Wire::OpenAi,
             _ => return None,
         };
-        Some(Self { name, wire, builtin: true })
+        Some(Self { name, wire, builtin: true, local: false })
+    }
+
+    /// A local model server with a conventional endpoint. These are always
+    /// resolvable, but only appear in the picker once discovery has found
+    /// models (or `providers.json` configures them explicitly).
+    pub fn local(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        if !LOCAL_PROVIDERS.contains(&name.as_str()) {
+            return None;
+        }
+        Some(Self { name, wire: Wire::OpenAi, builtin: false, local: true })
     }
 
     /// A user-defined endpoint. The name must already be a valid slug.
     pub fn custom(name: &str, wire: Wire) -> Self {
-        Self { name: name.to_ascii_lowercase(), wire, builtin: false }
+        Self { name: name.to_ascii_lowercase(), wire, builtin: false, local: false }
     }
 
-    /// The provider a stored row describes, or a built-in by name.
+    /// The provider a stored row describes, a local runtime, or a built-in.
     pub fn from_state(name: &str, kind: &str) -> Option<Self> {
         if let Some(p) = Self::builtin(name) {
             return Some(p);
@@ -135,21 +151,33 @@ impl Provider {
         // Rows written before custom providers stored a wire kind can only
         // have come from an OpenAI-compatible endpoint. Recover them instead
         // of hiding a provider (and a cached model list) the user already has;
-        // `/provider add <name> url=... type=anthropic` fixes the rare miss.
+        // editing `providers.json` fixes the rare miss.
         let wire = if kind.trim().is_empty() {
             Wire::OpenAi
         } else {
             Wire::parse(kind)?
         };
+        if let Some(p) = Self::local(name) {
+            return Some(Self { wire, ..p });
+        }
         Some(Self::custom(name, wire))
     }
 
-    /// Resolve a name against the built-ins, the provider file, and the
-    /// custom providers saved in the database.
+    /// Resolve a name against the built-ins, the local runtimes, the provider
+    /// file, and custom providers saved by an older build.
     pub fn resolve(name: &str, store: &crate::store::Store) -> Option<Self> {
         let name = name.trim().to_ascii_lowercase();
         if let Some(p) = Self::builtin(&name) {
             return Some(p);
+        }
+        if let Some(p) = Self::local(&name) {
+            // A file entry (or a legacy row) may pin a non-default endpoint or
+            // wire shape for this runtime.
+            let kind = crate::provider::file_provider(&name)
+                .map(|p| p.state.kind)
+                .or_else(|| store.provider_state(&name).map(|s| s.kind));
+            let wire = kind.as_deref().and_then(Wire::parse).unwrap_or(Wire::OpenAi);
+            return Some(Self { wire, ..p });
         }
         let kind = crate::provider::file_provider(&name)
             .map(|p| p.state.kind)
@@ -171,7 +199,15 @@ impl Provider {
     }
 
     pub fn is_custom(&self) -> bool {
-        !self.builtin
+        !self.builtin && !self.local
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.builtin
     }
 
     pub fn default_model(&self) -> &'static str {
@@ -181,7 +217,8 @@ impl Provider {
             "tokenharbor" => "claude-sonnet-4.6",
             // ponytail: fixed default, use /model for the full catalog
             "openrouter" => "openai/gpt-4.1",
-            // A custom endpoint names its own model; there is no honest guess.
+            // A local or custom endpoint names its own model; discovery or
+            // `providers.json` supplies it. There is no honest guess.
             _ => "",
         }
     }
@@ -192,6 +229,9 @@ impl Provider {
             "openai" => "https://api.openai.com/v1",
             "tokenharbor" => "https://tokenharbor.ai/v1",
             "openrouter" => "https://openrouter.ai/api/v1",
+            "ollama" => "http://127.0.0.1:11434/v1",
+            "lmstudio" => "http://127.0.0.1:1234/v1",
+            "vllm" => "http://127.0.0.1:8000/v1",
             _ => "",
         }
     }
@@ -205,6 +245,11 @@ impl Provider {
             "openai" => "OPENAI_API_KEY".to_string(),
             "tokenharbor" => "TOKENHARBOR_API_KEY".to_string(),
             "openrouter" => "OPENROUTER_API_KEY".to_string(),
+            // The conventional variables the local runtimes use. They are
+            // optional: these endpoints normally run without authentication.
+            "ollama" => "OLLAMA_API_KEY".to_string(),
+            "lmstudio" => "LMSTUDIO_API_KEY".to_string(),
+            "vllm" => "VLLM_API_KEY".to_string(),
             other => format!(
                 "RIFT_{}_API_KEY",
                 other.to_ascii_uppercase().replace(['-', '.'], "_")
@@ -243,14 +288,14 @@ pub fn valid_custom_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The conventional OpenAI-compatible URL for well-known local servers, so
-/// `/provider add ollama model=llama3.2` works without spelling the URL out.
+/// The conventional OpenAI-compatible URL for well-known local servers, used
+/// when a `providers.json` entry names one without spelling the URL out.
 pub fn local_default_url(name: &str) -> Option<&'static str> {
     match name {
-        "ollama" => Some("http://localhost:11434/v1"),
-        "lmstudio" | "lm-studio" => Some("http://localhost:1234/v1"),
-        "llamacpp" | "llama-cpp" => Some("http://localhost:8080/v1"),
-        "vllm" => Some("http://localhost:8000/v1"),
+        "ollama" => Some("http://127.0.0.1:11434/v1"),
+        "lmstudio" | "lm-studio" => Some("http://127.0.0.1:1234/v1"),
+        "llamacpp" | "llama-cpp" => Some("http://127.0.0.1:8080/v1"),
+        "vllm" => Some("http://127.0.0.1:8000/v1"),
         _ => None,
     }
 }
@@ -262,8 +307,9 @@ pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"
 #[derive(Parser, Debug)]
 #[command(name = "rift", version, about = "One tool to rule them all: the shell")]
 pub struct Cli {
-    /// Provider id: anthropic, openai, tokenharbor, openrouter, or a custom one
-    /// added with `/provider add`.
+    /// Provider id: anthropic, openai, tokenharbor, openrouter, an
+    /// auto-discovered local runtime (ollama, lmstudio, vllm), or a custom one
+    /// declared in providers.json.
     #[arg(long, env = "SH_PROVIDER", default_value = "anthropic")]
     pub provider: String,
 
@@ -382,22 +428,42 @@ mod tests {
     fn a_saved_custom_provider_is_a_first_class_cli_target() {
         let store = crate::store::Store::memory();
         store.save_custom_provider(
-            "ollama",
+            "localbox",
             "openai",
             "llama3.2",
-            "http://localhost:11434/v1",
+            "http://localhost:8787/v1",
             "",
         );
-        let cfg = build(&["rift", "--provider", "ollama"], &store).unwrap();
-        assert_eq!(cfg.provider, Provider::custom("ollama", Wire::OpenAi));
+        let cfg = build(&["rift", "--provider", "localbox"], &store).unwrap();
+        assert_eq!(cfg.provider, Provider::custom("localbox", Wire::OpenAi));
         assert_eq!(cfg.model, "llama3.2");
-        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.base_url, "http://localhost:8787/v1");
         assert!(cfg.api_key.is_empty(), "custom endpoints may be keyless");
         assert!(!cfg.provider.requires_key());
-        // A custom name nobody saved is a startup error that says how to fix it.
+        // A name nobody saved is a startup error that says how to fix it.
         let err = build(&["rift", "--provider", "nope"], &store).unwrap_err().to_string();
         assert!(err.contains("unknown provider 'nope'"), "{err}");
-        assert!(err.contains("/provider add"), "{err}");
+        assert!(err.contains("providers.json"), "{err}");
+    }
+
+    #[test]
+    fn a_local_runtime_is_a_cli_target_without_registration() {
+        let store = crate::store::Store::memory();
+        store.save_models(
+            "ollama",
+            &["alpha:latest".to_string(), "qwen3:8b".to_string()],
+        );
+        store.remember_model("ollama", "qwen3:8b");
+        let cfg = build(&["rift", "--provider", "ollama"], &store).unwrap();
+        assert!(cfg.provider.is_local());
+        assert_eq!(cfg.provider.name(), "ollama");
+        assert_eq!(
+            cfg.model, "qwen3:8b",
+            "a remembered choice beats the first discovered model"
+        );
+        assert_eq!(cfg.base_url, "http://127.0.0.1:11434/v1");
+        assert!(cfg.api_key.is_empty());
+        assert!(!cfg.provider.requires_key());
     }
 
     #[test]
@@ -474,9 +540,11 @@ impl Config {
         };
         let Some(provider) = Provider::resolve(&provider_name, store) else {
             anyhow::bail!(
-                "unknown provider '{provider_name}'. Built-in: {}. Add a custom one with \
-                 /provider add <name> url=<url>",
-                crate::commands::PROVIDERS.join(", ")
+                "unknown provider '{provider_name}'. Built-in: {}. Local: {}. Declare a custom \
+                 endpoint in {}",
+                crate::commands::PROVIDERS.join(", "),
+                LOCAL_PROVIDERS.join(", "),
+                providers_path().display()
             );
         };
         let saved = crate::provider::state(provider.name(), store);

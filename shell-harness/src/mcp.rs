@@ -13,7 +13,7 @@
 //! that will not start is reported once and skipped, because a broken optional
 //! integration must not stop a shell session from opening.
 
-use crate::mcp_http::{HttpServer, CALL_TIMEOUT as HTTP_CALL_TIMEOUT, HANDSHAKE_TIMEOUT as HTTP_HANDSHAKE_TIMEOUT};
+use crate::mcp_http::HttpServer;
 use crate::provider::ToolSpec;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -21,9 +21,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One tool a server offers, with the server it belongs to. The wire name is
 /// `server__tool`: MCP tool names are only unique within a server, and the
@@ -53,16 +54,32 @@ pub fn split_wire_name(wire: &str) -> Option<(&str, &str)> {
     Some((server, tool))
 }
 
-/// How long a request may take. Tool calls get longer than the handshake
-/// because a server may legitimately shell out and wait. Both transports use
-/// the same budgets: a slow tool is slow whichever wire it arrived on.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long startup may take: one server's spawn, handshake, and tool
+/// listing. Every server runs in its own thread, so this is also the whole
+/// startup budget, not a per-server slice of a serial wait.
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one tool call may take. Longer than startup because a server may
+/// legitimately shell out and wait. Both transports use the same budget: a
+/// slow tool is slow whichever wire it arrived on.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One configured server, and the process behind it once it has started.
+/// The startup budget, with an environment override for slow servers.
+pub fn startup_timeout() -> Duration {
+    std::env::var("RIFT_MCP_STARTUP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or(STARTUP_TIMEOUT)
+}
+
+/// One configured server, and the process behind it once it has started. The
+/// child is shared so the manager can kill a process whose handshake is still
+/// in flight when the session exits.
 struct Server {
     name: String,
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
     next_id: u64,
@@ -135,8 +152,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -156,73 +174,210 @@ impl Backend {
     }
 }
 
-/// Every configured server, connected. Cheap to hold: one process or one
-/// connection each, idle until a call arrives.
+/// One finished background connection attempt.
+struct Connected {
+    name: String,
+    outcome: Result<(Backend, Vec<McpTool>), String>,
+    elapsed: Duration,
+}
+
+/// Every configured server. Connections run in the background: `connect`
+/// returns as soon as the threads are spawned, and `drain` folds finished
+/// servers into the toolset. A slow or dead server delays only itself.
 pub struct Manager {
     servers: Vec<(String, Backend)>,
     tools: Vec<McpTool>,
     notes: Vec<String>,
+    /// Names of configured servers whose connection attempt is still running.
+    pending: Vec<String>,
+    failed: Vec<(String, String)>,
+    disabled: Vec<String>,
+    rx: Option<std::sync::mpsc::Receiver<Connected>>,
+    cancel: Arc<AtomicBool>,
+    /// Every spawned child, so a session that exits mid-handshake can still
+    /// kill the servers it started.
+    children: Arc<Mutex<Vec<Arc<Mutex<Child>>>>>,
 }
 
 impl Manager {
     /// An empty manager: no servers, so the harness runs on its own two tools.
     pub fn none() -> Self {
-        Manager { servers: Vec::new(), tools: Vec::new(), notes: Vec::new() }
+        Manager {
+            servers: Vec::new(),
+            tools: Vec::new(),
+            notes: Vec::new(),
+            pending: Vec::new(),
+            failed: Vec::new(),
+            disabled: Vec::new(),
+            rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            children: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
-    /// Connect to every server configured for `cwd`. Never fails: each failure
-    /// becomes a note, and the rest of the session carries on.
+    /// Start connecting to every server configured for `cwd`. Never fails and
+    /// never blocks: each server gets a thread, and the session opens while
+    /// they work. `drain` collects them as they land.
     pub fn connect(cwd: &Path) -> Self {
+        let mut mgr = Manager::none();
         let cfg = match load_config(cwd) {
             Ok(c) => c,
-            Err(e) => return Manager { servers: vec![], tools: vec![], notes: vec![format!("{e:#}")] },
-        };
-        let mut mgr = Manager::none();
-        for (name, spec) in cfg {
-            match start(&name, &spec) {
-                Ok(mut server) => {
-                    let timeout = match server {
-                        Backend::Stdio(_) => HANDSHAKE_TIMEOUT,
-                        Backend::Http(_) => HTTP_HANDSHAKE_TIMEOUT,
-                    };
-                    match server.request("tools/list", json!({}), timeout) {
-                        Ok(list) => {
-                            let tools = tools_from(&name, &list);
-                            mgr.notes.push(format!(
-                                "mcp: {name} connected ({} tool{})",
-                                tools.len(),
-                                if tools.len() == 1 { "" } else { "s" }
-                            ));
-                            mgr.tools.extend(tools);
-                            mgr.servers.push((name.clone(), server));
-                        }
-                        Err(e) => {
-                            mgr.notes.push(format!("mcp: {name} listed no tools: {e:#}"));
-                        }
-                    }
-                }
-                Err(e) => mgr.notes.push(format!("mcp: {name} did not start: {e:#}")),
+            Err(e) => {
+                mgr.notes.push(format!("{e:#}"));
+                return mgr;
             }
+        };
+        let mut jobs = Vec::new();
+        for (name, spec) in cfg {
+            if spec.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false) {
+                mgr.disabled.push(name.clone());
+                mgr.notes.push(format!("mcp: {name} is disabled"));
+                continue;
+            }
+            jobs.push((name, spec));
         }
+        if jobs.is_empty() {
+            return mgr;
+        }
+        let count = jobs.len();
+        let (tx, rx) = channel();
+        mgr.rx = Some(rx);
+        for (name, spec) in jobs {
+            mgr.pending.push(name.clone());
+            let tx = tx.clone();
+            let cancel = mgr.cancel.clone();
+            let children = mgr.children.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let outcome = if cancel.load(Ordering::Relaxed) {
+                    Err("cancelled".to_string())
+                } else {
+                    connect_one(&name, &spec, &cancel, &children).map_err(|e| format!("{e:#}"))
+                };
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(Connected { name, outcome, elapsed: started.elapsed() });
+            });
+        }
+        drop(tx);
+        mgr.notes.push(format!(
+            "mcp: connecting {count} server{} in the background",
+            if count == 1 { "" } else { "s" }
+        ));
         mgr
     }
 
-    /// One line per server, for the arrival banner.
-    pub fn notes(&self) -> &[String] {
-        &self.notes
+    /// Fold every finished background connection into the manager. Non-blocking
+    /// and safe to call at any time.
+    fn drain(&mut self) {
+        let mut done: Vec<Connected> = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(c) => done.push(c),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.rx = None;
+        }
+        for c in done {
+            self.pending.retain(|n| n != &c.name);
+            match c.outcome {
+                Ok((backend, tools)) => {
+                    let count = tools.len();
+                    self.notes.push(format!(
+                        "mcp: {} connected ({} tool{}, {:.1}s)",
+                        c.name,
+                        count,
+                        if count == 1 { "" } else { "s" },
+                        c.elapsed.as_secs_f64()
+                    ));
+                    self.tools.extend(tools);
+                    self.servers.push((c.name, backend));
+                }
+                Err(e) => {
+                    self.notes.push(format!(
+                        "mcp: {} failed after {:.1}s: {e}",
+                        c.name,
+                        c.elapsed.as_secs_f64()
+                    ));
+                    self.failed.push((c.name, e));
+                }
+            }
+        }
+        // A thread that panicked never sends; a disconnected channel must not
+        // leave servers looking connected forever.
+        if self.rx.is_none() {
+            self.pending.clear();
+        }
+    }
+
+    /// Wait until every background connection settles, or `timeout` passes.
+    pub fn wait_ready(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain();
+            if self.pending.is_empty() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+        }
+    }
+
+    /// The notes added since the last call, oldest first. Drained first, so a
+    /// caller printing notes also learns about just-finished connections.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        self.drain();
+        std::mem::take(&mut self.notes)
     }
 
     /// What `/mcp` reports: one verdict line per configured server, then the
-    /// tools each connected one contributed. Everything was learned at
-    /// startup, so asking never touches the servers again.
-    pub fn status(&self) -> String {
-        if self.notes.is_empty() {
+    /// tools each connected one contributed. A server still connecting says so.
+    pub fn status(&mut self) -> String {
+        self.drain();
+        if self.servers.is_empty()
+            && self.pending.is_empty()
+            && self.failed.is_empty()
+            && self.disabled.is_empty()
+        {
+            if !self.notes.is_empty() {
+                return self.notes.join("\n");
+            }
             return "no MCP servers configured. Add one to .rift/mcp.json, e.g. \
                    {\"mcpServers\": {\"name\": {\"command\": \"cmd\", \"args\": [...]}}} for stdio \
                    or {\"mcpServers\": {\"name\": {\"url\": \"https://...\", \"headers\": {}}}} for HTTP."
                 .to_string();
         }
-        let mut out = self.notes.join("\n");
+        let mut lines: Vec<String> = Vec::new();
+        for (name, _) in &self.servers {
+            let count = self.tools.iter().filter(|t| &t.server == name).count();
+            lines.push(format!(
+                "mcp: {name} connected ({count} tool{})",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        for name in &self.pending {
+            lines.push(format!("mcp: {name} connecting…"));
+        }
+        for name in &self.disabled {
+            lines.push(format!("mcp: {name} disabled"));
+        }
+        for (name, err) in &self.failed {
+            lines.push(format!("mcp: {name} failed: {err}"));
+        }
+        let mut out = lines.join("\n");
         for t in &self.tools {
             let desc = t.description.lines().next().unwrap_or("").trim();
             out.push_str(&format!("\n  {}  {}", t.wire_name(), desc));
@@ -237,8 +392,11 @@ impl Manager {
         self.tools.is_empty()
     }
 
-    /// This session's tool list: the harness's own, then every server's.
-    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+    /// This session's tool list: the harness's own, then every server's that
+    /// has connected so far. Drained first so a server that just landed is
+    /// visible to the next model round.
+    pub fn tool_specs(&mut self) -> Vec<ToolSpec> {
+        self.drain();
         let mut specs = crate::provider::builtin_tools();
         for t in &self.tools {
             specs.push(ToolSpec {
@@ -254,9 +412,13 @@ impl Manager {
     /// model is told what went wrong and can try something else, which is
     /// better than the turn dying over one unavailable tool.
     pub fn call(&mut self, wire_name: &str, args: &Value) -> String {
+        self.drain();
         let Some((server, tool)) = split_wire_name(wire_name) else {
             return format!("[tool error] {wire_name} is not an MCP tool name");
         };
+        if self.pending.iter().any(|n| n == server) {
+            return format!("[tool error] MCP server {server} is still connecting");
+        }
         let mut hit = None;
         for (i, (n, _)) in self.servers.iter().enumerate() {
             if n == server {
@@ -268,15 +430,42 @@ impl Manager {
             return format!("[tool error] no MCP server named {server}");
         };
         let params = json!({"name": tool, "arguments": args});
-        let timeout = match &self.servers[i].1 {
-            Backend::Stdio(_) => CALL_TIMEOUT,
-            Backend::Http(_) => HTTP_CALL_TIMEOUT,
-        };
-        match self.servers[i].1.request("tools/call", params, timeout) {
+        match self.servers[i].1.request("tools/call", params, CALL_TIMEOUT) {
             Ok(result) => Server::text_of(&result),
             Err(e) => format!("[tool error] {e:#}"),
         }
     }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        // Pending threads notice the flag within the startup budget; this
+        // walks everything already spawned so nothing is orphaned on exit.
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        for child in children.iter() {
+            let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = c.kill();
+        }
+    }
+}
+
+/// One background connection: start the server, handshake, list its tools.
+fn connect_one(
+    name: &str,
+    spec: &Value,
+    cancel: &AtomicBool,
+    children: &Arc<Mutex<Vec<Arc<Mutex<Child>>>>>,
+) -> Result<(Backend, Vec<McpTool>)> {
+    let mut server = start(name, spec, children)?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    let list = server.request("tools/list", json!({}), startup_timeout())?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok((server, tools_from(name, &list)))
 }
 
 /// Turn a `tools/list` reply into tools, skipping entries that could not be
@@ -305,7 +494,7 @@ fn tools_from(server: &str, list: &Value) -> Vec<McpTool> {
 
 /// Start one server. A spec with a `url` is an HTTP server; one with a
 /// `command` is a child process. Anything else has nothing to run.
-fn start(name: &str, spec: &Value) -> Result<Backend> {
+fn start(name: &str, spec: &Value, children: &Arc<Mutex<Vec<Arc<Mutex<Child>>>>>) -> Result<Backend> {
     if let Some(url) = spec["url"].as_str().filter(|u| !u.is_empty()) {
         let headers: Vec<(String, String)> = spec["headers"]
             .as_object()
@@ -316,18 +505,18 @@ fn start(name: &str, spec: &Value) -> Result<Backend> {
             })
             .unwrap_or_default();
         if !url.is_empty() {
-            return HttpServer::connect(url, &headers)
+            return HttpServer::connect(url, &headers, startup_timeout())
                 .map(Backend::Http)
                 .with_context(|| format!("server {name} ({url})"));
         }
     }
-    start_stdio(name, spec).map(Backend::Stdio)
+    start_stdio(name, spec, children).map(Backend::Stdio)
 }
 
 /// Start one stdio server: spawn it, wire a reader thread to its stdout, and
 /// run the handshake. The reader thread owns stdout for the process's life and
 /// routes each reply to whoever is waiting on that id.
-fn start_stdio(name: &str, spec: &Value) -> Result<Server> {
+fn start_stdio(name: &str, spec: &Value, children: &Arc<Mutex<Vec<Arc<Mutex<Child>>>>>) -> Result<Server> {
     let command = spec["command"]
         .as_str()
         .filter(|c| !c.is_empty())
@@ -358,6 +547,10 @@ fn start_stdio(name: &str, spec: &Value) -> Result<Server> {
         .with_context(|| format!("spawning {command}"))?;
     let stdin = child.stdin.take().context("no stdin on the server process")?;
     let stdout = child.stdout.take().context("no stdout on the server process")?;
+    let child = Arc::new(Mutex::new(child));
+    // Registered before the handshake: a session that exits mid-connect can
+    // still kill a server whose thread is blocked on a reply.
+    children.lock().unwrap_or_else(|e| e.into_inner()).push(child.clone());
     let pending: Arc<Mutex<HashMap<u64, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
     {
         let pending = pending.clone();
@@ -388,7 +581,7 @@ fn start_stdio(name: &str, spec: &Value) -> Result<Server> {
             "capabilities": {},
             "clientInfo": {"name": "rift", "version": env!("CARGO_PKG_VERSION")},
         }),
-        HANDSHAKE_TIMEOUT,
+        startup_timeout(),
     )?;
     // The protocol requires this before any other request. A server that does
     // not want it will ignore it, so a failure here is not worth reporting.
@@ -466,7 +659,7 @@ mod tests {
     /// It answers `initialize`, lists one tool, and echoes the arguments back
     /// on `tools/call` so the round trip can be asserted end to end.
     const FAKE_SERVER: &str = r#"
-import json, sys
+import json, os, sys, time
 def send(v):
     sys.stdout.write(json.dumps(v) + "\n"); sys.stdout.flush()
 for line in sys.stdin:
@@ -478,6 +671,7 @@ for line in sys.stdin:
     if m == "initialize":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}})
     elif m == "tools/list":
+        time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"echo","description":"echo the args","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}})
     elif m == "tools/call":
         a = msg["params"]["arguments"]
@@ -502,34 +696,55 @@ for line in sys.stdin:
         })
     }
 
-    /// A manager connected to the fake server, or `None` without Python.
-    fn fake() -> Option<Manager> {
+    /// Write a fake-server config and point `RIFT_MCP_CONFIG` at it while
+    /// `f` runs, so one test's server cannot leak into another's. Times `f`,
+    /// because "connect does not wait" is asserted on that number.
+    fn with_fake_config<R>(
+        name: &str,
+        delay: f64,
+        f: impl FnOnce() -> R,
+    ) -> Option<(R, Duration)> {
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let interpreter = python()?;
         let dir = std::env::temp_dir().join(format!("rift-mcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("server.py");
+        let script = dir.join(format!("{name}.py"));
         std::fs::write(&script, FAKE_SERVER).unwrap();
-        let cfg = dir.join("mcp.json");
+        let cfg = dir.join(format!("{name}.json"));
         std::fs::write(
             &cfg,
-            json!({"mcpServers": {"fake": {"command": interpreter, "args": [script.to_string_lossy()]}}})
-                .to_string(),
+            json!({"mcpServers": {name: {
+                "command": interpreter,
+                "args": [script.to_string_lossy()],
+                "env": {"FAKE_DELAY": delay.to_string()},
+            }}})
+            .to_string(),
         )
         .unwrap();
         let saved = std::env::var("RIFT_MCP_CONFIG").ok();
         std::env::set_var("RIFT_MCP_CONFIG", cfg.to_string_lossy().to_string());
-        let mgr = Manager::connect(Path::new("/tmp"));
+        let started = Instant::now();
+        let out = f();
+        let took = started.elapsed();
         match saved {
             Some(v) => std::env::set_var("RIFT_MCP_CONFIG", v),
             None => std::env::remove_var("RIFT_MCP_CONFIG"),
         }
+        Some((out, took))
+    }
+
+    /// A manager whose fake server has finished connecting, or `None`
+    /// without Python.
+    fn fake() -> Option<Manager> {
+        let mut mgr = with_fake_config("fake", 0.0, || Manager::connect(Path::new("/tmp")))
+            .map(|(m, _)| m)?;
+        mgr.wait_ready(Duration::from_secs(5));
         Some(mgr)
     }
 
     #[test]
     fn a_server_contributes_its_tools_under_a_namespaced_name() {
-        let Some(mgr) = fake() else { return };
+        let Some(mut mgr) = fake() else { return };
         let specs = mgr.tool_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         // The harness's own tools come first, so `shell` is always there.
@@ -549,8 +764,30 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn connect_returns_before_a_slow_server_finishes() {
+        let Some((mut mgr, took)) =
+            with_fake_config("slow", 1.0, || Manager::connect(Path::new("/tmp")))
+        else {
+            return;
+        };
+        assert!(
+            took < Duration::from_millis(300),
+            "connect blocked for {took:?}; startup must not wait for servers"
+        );
+        assert!(
+            mgr.tool_specs().iter().all(|s| s.name != "slow__echo"),
+            "the slow server should still be connecting"
+        );
+        mgr.wait_ready(Duration::from_secs(5));
+        assert!(
+            mgr.tool_specs().iter().any(|s| s.name == "slow__echo"),
+            "the slow server must land once it finishes"
+        );
+    }
+
+    #[test]
     fn status_reports_a_connected_server_and_its_tools() {
-        let Some(mgr) = fake() else { return };
+        let Some(mut mgr) = fake() else { return };
         let st = mgr.status();
         assert!(st.contains("mcp: fake connected (1 tool)"), "{st}");
         assert!(st.contains("fake__echo"), "{st}");
@@ -559,7 +796,7 @@ for line in sys.stdin:
 
     #[test]
     fn status_with_no_servers_says_how_to_add_one() {
-        let mgr = Manager::none();
+        let mut mgr = Manager::none();
         assert!(mgr.status().contains("no MCP servers configured"), "{}", mgr.status());
         assert!(mgr.status().contains(".rift/mcp.json"), "{}", mgr.status());
     }
@@ -576,7 +813,7 @@ for line in sys.stdin:
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("rift-mcp-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("mcp.json");
+        let cfg = dir.join("broken.json");
         std::fs::write(
             &cfg,
             json!({"mcpServers": {"broken": {"command": "/nonexistent/definitely-not-a-program"}}})
@@ -585,17 +822,18 @@ for line in sys.stdin:
         .unwrap();
         let saved = std::env::var("RIFT_MCP_CONFIG").ok();
         std::env::set_var("RIFT_MCP_CONFIG", cfg.to_string_lossy().to_string());
-        let mgr = Manager::connect(Path::new("/tmp"));
+        let mut mgr = Manager::connect(Path::new("/tmp"));
         match saved {
             Some(v) => std::env::set_var("RIFT_MCP_CONFIG", v),
             None => std::env::remove_var("RIFT_MCP_CONFIG"),
         }
+        mgr.wait_ready(Duration::from_secs(5));
         assert!(mgr.is_empty(), "a dead server must not contribute tools");
         assert_eq!(mgr.tool_specs().len(), 2, "the harness's own tools survive");
+        let notes = mgr.take_notes();
         assert!(
-            mgr.notes().iter().any(|n| n.contains("broken") && n.contains("did not start")),
-            "{:?}",
-            mgr.notes()
+            notes.iter().any(|n| n.contains("broken") && n.contains("failed")),
+            "{notes:?}"
         );
     }
 
@@ -604,13 +842,13 @@ for line in sys.stdin:
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("RIFT_MCP_CONFIG").ok();
         std::env::set_var("RIFT_MCP_CONFIG", "/nonexistent/mcp.json");
-        let mgr = Manager::connect(Path::new("/tmp"));
+        let mut mgr = Manager::connect(Path::new("/tmp"));
         match saved {
             Some(v) => std::env::set_var("RIFT_MCP_CONFIG", v),
             None => std::env::remove_var("RIFT_MCP_CONFIG"),
         }
         assert!(mgr.is_empty());
-        assert!(mgr.notes().is_empty());
+        assert!(mgr.take_notes().is_empty());
     }
 
     #[test]
@@ -648,11 +886,9 @@ mod live_tests {
             Some(v) => std::env::set_var("RIFT_MCP_CONFIG", v),
             None => std::env::remove_var("RIFT_MCP_CONFIG"),
         }
-        let notes = mgr.notes().iter().cloned().collect::<Vec<_>>().join(" | ");
-        assert!(
-            mgr.notes().iter().any(|n| n.contains("solana connected")),
-            "connect failed: {notes}"
-        );
+        mgr.wait_ready(Duration::from_secs(15));
+        let notes = mgr.take_notes().join(" | ");
+        assert!(notes.contains("solana connected"), "connect failed: {notes}");
         let names: Vec<String> = mgr.tools.iter().map(|t| t.wire_name()).collect();
         assert!(
             names.iter().any(|n| n.contains("Documentation_Search") || n.contains("Expert")),
