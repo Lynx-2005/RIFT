@@ -54,13 +54,13 @@ pub struct RawGuard {
 impl RawGuard {
     pub fn new() -> Option<Self> {
         if !super::is_tty() {
-            return Some(RawGuard { old: None });
+            return None;
         }
         unsafe {
             let h = handle(STD_INPUT_HANDLE);
             let mut mode: CONSOLE_MODE = 0;
             if GetConsoleMode(h, &mut mode) == 0 {
-                return Some(RawGuard { old: None });
+                return None;
             }
             // Mouse and window events are console input records, not keys.
             // With VT input enabled the console turns them into escape
@@ -78,7 +78,9 @@ impl RawGuard {
                     | ENABLE_WINDOW_INPUT))
                 | ENABLE_EXTENDED_FLAGS
                 | ENABLE_VIRTUAL_TERMINAL_INPUT;
-            SetConsoleMode(h, raw);
+            if SetConsoleMode(h, raw) == 0 {
+                return None;
+            }
             Some(RawGuard { old: Some((h, mode)) })
         }
     }

@@ -239,7 +239,6 @@ impl Manager {
         if jobs.is_empty() {
             return mgr;
         }
-        let count = jobs.len();
         let (tx, rx) = channel();
         mgr.rx = Some(rx);
         for (name, spec) in jobs {
@@ -261,10 +260,6 @@ impl Manager {
             });
         }
         drop(tx);
-        mgr.notes.push(format!(
-            "mcp: connecting {count} server{} in the background",
-            if count == 1 { "" } else { "s" }
-        ));
         mgr
     }
 
@@ -292,14 +287,9 @@ impl Manager {
             self.pending.retain(|n| n != &c.name);
             match c.outcome {
                 Ok((backend, tools)) => {
-                    let count = tools.len();
-                    self.notes.push(format!(
-                        "mcp: {} connected ({} tool{}, {:.1}s)",
-                        c.name,
-                        count,
-                        if count == 1 { "" } else { "s" },
-                        c.elapsed.as_secs_f64()
-                    ));
+                    // A successful connection is routine: the banner already
+                    // carries the count, and /mcp has the per-server detail.
+                    // Only a failure is worth a line in the transcript.
                     self.tools.extend(tools);
                     self.servers.push((c.name, backend));
                 }
@@ -341,6 +331,15 @@ impl Manager {
     pub fn take_notes(&mut self) -> Vec<String> {
         self.drain();
         std::mem::take(&mut self.notes)
+    }
+
+    /// Enabled servers, whether connected already or still connecting. This is
+    /// the glanceable number in the banner: unlike `servers.len()` it does not
+    /// read zero for the first few hundred milliseconds of a session, and a
+    /// server that has already failed has left `pending` by the time it prints.
+    pub fn active_count(&mut self) -> usize {
+        self.drain();
+        self.servers.len() + self.pending.len()
     }
 
     /// What `/mcp` reports: one verdict line per configured server, then the
@@ -783,6 +782,20 @@ for line in sys.stdin:
             mgr.tool_specs().iter().any(|s| s.name == "slow__echo"),
             "the slow server must land once it finishes"
         );
+    }
+
+    #[test]
+    fn the_active_count_includes_servers_still_connecting() {
+        let Some((mut mgr, _)) =
+            with_fake_config("slow", 1.0, || Manager::connect(Path::new("/tmp")))
+        else {
+            return;
+        };
+        // The banner prints while the connection is in flight; it must still
+        // say one server, not zero.
+        assert_eq!(mgr.active_count(), 1);
+        mgr.wait_ready(Duration::from_secs(5));
+        assert_eq!(mgr.active_count(), 1);
     }
 
     #[test]

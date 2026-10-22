@@ -8,16 +8,20 @@ pub struct RawGuard {
 impl RawGuard {
     pub fn new() -> Option<Self> {
         if !super::is_tty() {
-            return Some(RawGuard { _private: () });
+            return None;
         }
         unsafe {
-            libc::tcgetattr(0, &raw mut RAW_OLD as *mut _);
+            if libc::tcgetattr(0, &raw mut RAW_OLD as *mut _) != 0 {
+                return None;
+            }
             let mut new = RAW_OLD;
             new.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
             new.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
             new.c_cc[libc::VMIN] = 1;
             new.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(0, libc::TCSAFLUSH, &new);
+            if libc::tcsetattr(0, libc::TCSAFLUSH, &new) != 0 {
+                return None;
+            }
         }
         Some(RawGuard { _private: () })
     }

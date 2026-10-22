@@ -80,10 +80,13 @@ pub fn run(mut cfg: Config, store: crate::store::Store) -> Result<()> {
         return Ok(());
     }
 
-    ui::banner(&session.cfg);
+    let raw = ui::banner(&session.cfg, session.tools.active_mcps());
     crate::stats::spawn_sampler();
     crate::term::watch_resize();
     let mut rl = ui::Reader::new();
+    // Keep the reveal's raw mode through the first prompt: keys typed during
+    // the animation must queue silently instead of being echoed or flushed.
+    rl.hold_raw(raw);
     // Lines typed while the agent works land here; they run oldest first.
     let work = WhileWorking::new();
     let mut prefill: Option<String> = None;
@@ -930,6 +933,14 @@ impl Tools {
         match self.mcp.lock() {
             Ok(mut m) => m.take_notes(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Enabled MCP servers, connected or still connecting: the banner's count.
+    pub fn active_mcps(&self) -> usize {
+        match self.mcp.lock() {
+            Ok(mut m) => m.active_count(),
+            Err(_) => 0,
         }
     }
 

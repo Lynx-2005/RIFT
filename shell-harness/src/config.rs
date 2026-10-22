@@ -334,7 +334,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 120)]
     pub timeout: u64,
 
-    /// Replace the animated wait spinner with a single static line.
+    /// Replace the animated wait spinner and startup reveal with static text.
     #[arg(long)]
     pub no_spinner: bool,
 
