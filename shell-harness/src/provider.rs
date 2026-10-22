@@ -208,6 +208,8 @@ pub struct ThinkingSupport {
     pub budget_max: Option<u32>,
     /// The model can be switched on and off without a graded effort.
     pub toggle: bool,
+    /// Whether the model accepts image (vision) inputs.
+    pub vision: bool,
 }
 
 impl ThinkingSupport {
@@ -215,7 +217,21 @@ impl ThinkingSupport {
     /// `Some` with `reasoning: false` is an explicit "this model cannot think".
     pub fn from_model(m: &Value) -> Option<Self> {
         let reasoning = m.get("reasoning").and_then(Value::as_bool)?;
-        let mut support = Self { known: true, reasoning, ..Self::default() };
+        let vision = m
+            .get("attachment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || m.get("modalities")
+                .and_then(|mm| mm.get("input"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|v| v.as_str() == Some("image")))
+                .unwrap_or(false);
+        let mut support = Self {
+            known: true,
+            reasoning,
+            vision,
+            ..Self::default()
+        };
         if !reasoning {
             return Some(support);
         }
@@ -246,7 +262,25 @@ impl ThinkingSupport {
                     .or_else(|| map.get("reasoning"))
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                let mut support = Self { known: true, reasoning, ..Self::default() };
+                let vision = map
+                    .get("vision")
+                    .or_else(|| map.get("attachment"))
+                    .map(|vv| match vv {
+                        Value::Bool(b) => *b,
+                        Value::Object(m) => m
+                            .get("supported")
+                            .or_else(|| m.get("vision"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                let mut support = Self {
+                    known: true,
+                    reasoning,
+                    vision,
+                    ..Self::default()
+                };
                 if !reasoning {
                     return Some(support);
                 }
@@ -336,6 +370,7 @@ impl ThinkingSupport {
                 .and_then(Value::as_u64)
                 .and_then(|v| u32::try_from(v).ok()),
             toggle: v.get("toggle").and_then(Value::as_bool).unwrap_or(false),
+            vision: v.get("vision").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -687,8 +722,83 @@ pub fn thinking_support(
     thinking_support_from(store, provider, model, file.as_ref())
 }
 
-/// The same resolution with the provider-file entry already loaded. Tests use
-/// this directly because `file_provider` is disabled under `cfg(test)`.
+pub type VisionSupport = ThinkingSupport;
+
+/// Resolve a model's vision support. Delegates to `thinking_support`, which now
+/// carries vision capability alongside reasoning.
+pub fn vision_support(
+    store: Option<&crate::store::Store>,
+    provider: &Provider,
+    model: &str,
+) -> VisionSupport {
+    thinking_support(store, provider, model)
+}
+
+/// Map a file extension to an image MIME type. `None` for non-image files.
+pub fn image_mime_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Whether `path` points at an existing image file.
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    path.is_file() && image_mime_type(path).is_some()
+}
+
+/// Read an image file and return its standard base64 encoding.
+pub fn read_image_base64(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(base64_encode(&bytes))
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) & 63] as char);
+        out.push(TABLE[(n >> 12) & 63] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(n >> 6) & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[n & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Pull image file paths out of a user message.
+pub fn extract_image_paths(text: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for raw in text.split_whitespace() {
+        let trimmed = raw.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == ',' || c == ';' || c == ':' || c == '.'
+        });
+        // Avoid stripping the extension's leading dot by re-adding? The trim above
+        // can remove a trailing dot from "file.png." but not "file.png" (no trailing
+        // dot). A leading dot path like ".hidden" is unlikely for images.
+        let path = std::path::PathBuf::from(trimmed);
+        if is_image_path(&path) && !out.iter().any(|p| p == &path) {
+            out.push(path);
+        }
+    }
+    out
+}
 pub(crate) fn thinking_support_from(
     store: Option<&crate::store::Store>,
     provider: &Provider,
@@ -778,6 +888,7 @@ fn merge_support(a: ThinkingSupport, b: ThinkingSupport) -> ThinkingSupport {
             (None, y) => y,
         },
         toggle: a.toggle || b.toggle,
+        vision: a.vision || b.vision,
     }
 }
 
@@ -1107,7 +1218,26 @@ fn anthropic_request(
         let mut messages: Vec<Value> = Vec::new();
         for m in history {
             match m {
-                Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+                Msg::User(t) => {
+                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.known {
+                        crate::provider::extract_image_paths(t)
+                    } else {
+                        Vec::new()
+                    };
+                    if images.is_empty() {
+                        messages.push(json!({"role": "user", "content": t}));
+                    } else {
+                        let mut blocks = vec![json!({"type": "text", "text": t})];
+                        for p in images {
+                            if let (Some(mime), Some(data)) =
+                                (crate::provider::image_mime_type(&p), crate::provider::read_image_base64(&p))
+                            {
+                                blocks.push(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}));
+                            }
+                        }
+                        messages.push(json!({"role": "user", "content": blocks}));
+                    }
+                }
                 Msg::Assistant { text, calls } => {
                     let mut blocks = Vec::new();
                     if !text.is_empty() {
@@ -1208,7 +1338,26 @@ fn openai_request(
         let mut messages = vec![json!({"role": "system", "content": system(cfg, context)})];
         for m in history {
             match m {
-                Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+                Msg::User(t) => {
+                    let images = if cfg.thinking_support.vision || !cfg.thinking_support.known {
+                        crate::provider::extract_image_paths(t)
+                    } else {
+                        Vec::new()
+                    };
+                    if images.is_empty() {
+                        messages.push(json!({"role": "user", "content": t}));
+                    } else {
+                        let mut blocks: Vec<Value> = vec![json!({"type": "text", "text": t})];
+                        for p in images {
+                            if let (Some(mime), Some(data)) =
+                                (crate::provider::image_mime_type(&p), crate::provider::read_image_base64(&p))
+                            {
+                                blocks.push(json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", mime, data)}}));
+                            }
+                        }
+                        messages.push(json!({"role": "user", "content": blocks}));
+                    }
+                }
                 Msg::Assistant { text, calls } => {
                     let mut msg = json!({"role": "assistant", "content": text});
                     if !calls.is_empty() {
@@ -1548,7 +1697,33 @@ fn models_from(
             .and_then(|v| ThinkingSupport::from_config(v, wire))
         {
             thinking.retain(|(seen, _)| seen != &id);
-            thinking.push((id, support));
+            thinking.push((id.clone(), support));
+        }
+        // A standalone `vision` block (or `attachment` flag) on a model entry
+        // also declares vision support, even without a thinking block.
+        let vision_val = spec.and_then(|spec| spec.get("vision").or_else(|| spec.get("attachment")));
+        if let Some(vv) = vision_val {
+            let v = match vv {
+                Value::Bool(b) => *b,
+                Value::Object(m) => m
+                    .get("supported")
+                    .or_else(|| m.get("vision"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                _ => false,
+            };
+            if let Some((_, support)) = thinking.iter_mut().rev().find(|(seen, _)| seen == &id) {
+                support.vision = support.vision || v;
+            } else {
+                thinking.push((
+                    id.clone(),
+                    ThinkingSupport {
+                        known: true,
+                        vision: v,
+                        ..Default::default()
+                    },
+                ));
+            }
         }
     };
     match v {
@@ -1612,6 +1787,30 @@ pub(crate) fn parse_providers(text: &str) -> Result<Vec<FileProvider>, String> {
         let thinking = spec
             .get("thinking")
             .and_then(|v| ThinkingSupport::from_config(v, wire));
+        // A standalone `vision` block declares vision support for every model
+        // this provider serves, even without a thinking block.
+        let mut thinking = thinking;
+        if let Some(vv) = spec.get("vision").or_else(|| spec.get("attachment")) {
+            let v = match vv {
+                Value::Bool(b) => *b,
+                Value::Object(m) => m
+                    .get("supported")
+                    .or_else(|| m.get("vision"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                _ => false,
+            };
+            match thinking {
+                Some(ref mut t) => t.vision = t.vision || v,
+                None => {
+                    thinking = Some(ThinkingSupport {
+                        known: true,
+                        vision: v,
+                        ..Default::default()
+                    })
+                }
+            }
+        }
         let model = text_field(spec, &["model"])
             .map(str::to_string)
             .or_else(|| models.first().cloned())
@@ -1881,6 +2080,7 @@ mod tests {
             budget_min: budget.map(|(min, _)| min),
             budget_max: budget.map(|(_, max)| max),
             toggle,
+            vision: false,
         }
     }
 
@@ -2761,3 +2961,4 @@ mod catalog_live_tests {
         );
     }
 }
+

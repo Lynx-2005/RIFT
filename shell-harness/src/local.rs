@@ -219,6 +219,8 @@ struct ShowInfo {
     /// either described thinking controls, listed the thinking capability, or
     /// had no thinking capability at all.
     thinking: crate::provider::ThinkingSupport,
+    /// Whether the model accepts image (vision) inputs.
+    vision: bool,
 }
 
 type ShowCache = Mutex<HashMap<String, (String, ShowInfo)>>;
@@ -333,6 +335,7 @@ fn ollama_show_info(body: &Value) -> ShowInfo {
             })
     };
     let completion = capability("completion");
+    let vision = capability("vision");
     let context = body
         .get("model_info")
         .and_then(Value::as_object)
@@ -345,7 +348,7 @@ fn ollama_show_info(body: &Value) -> ShowInfo {
                 }
             })
         });
-    let thinking = if capability("thinking") {
+    let mut thinking = if capability("thinking") {
         ollama_thinking(body).unwrap_or_else(legacy_thinking)
     } else {
         ThinkingSupport {
@@ -354,10 +357,12 @@ fn ollama_show_info(body: &Value) -> ShowInfo {
             ..Default::default()
         }
     };
+    thinking.vision = vision;
     ShowInfo {
         completion,
         context,
         thinking,
+        vision,
     }
 }
 
