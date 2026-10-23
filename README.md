@@ -3,9 +3,7 @@
 A terminal agent harness whose base tool is the shell, plus skills on disk and MCP servers.
 
 On launch the header shows the provider, model and the number of enabled MCP
-servers on the right. A short tagline reveal plays underneath it; the reveal is
-local, runs in about 100ms, and is skipped for pipes and reduced motion
-(`--no-spinner` / `SH_NO_SPINNER`).
+servers on the right.
 
 ## Install
 

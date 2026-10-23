@@ -367,54 +367,22 @@ fn row(s: &str) {
     crate::term::live_reprint();
 }
 
-/// The one-liner under the wordmark. It is a promise, so it is the one line
-/// here that keeps the terminal's own weight; `>_` is the shell mark, green so
-/// it reads as the live cursor that wrote it.
-const TAGLINE: &str = "your personal hacker living in terminal";
-
-/// The static shell mark in front of the tagline.
-const TAGLINE_MARK: &str = ">_";
-
-/// Glyphs the reveal uses before a character locks. ASCII on purpose: every
-/// monospace font carries these, and the line stays one cell per character on
-/// terminals where box drawing and braille fall back to a proportional font.
-const CIPHER: &[u8] = b"#%&*+=-/\\<>?01{}[]$@";
-
-/// Steps in the rift reveal. Each step locks one slice in the middle, so the
-/// line opens outward from its centre instead of typing left to right.
-const TAGLINE_STEPS: usize = 7;
-
-/// Hold time per reveal step. The whole flourish is about 100ms: long enough
-/// to read as motion, short enough that it stays inside the interval where a
-/// terminal action still feels instantaneous.
-const TAGLINE_STEP_MS: u64 = 10;
-
-/// The phrase holds green for one beat when it locks, then settles.
-const TAGLINE_FLASH_MS: u64 = 25;
-
 /// The arrival line. Segments fall off the end when the window is narrow,
 /// rather than wrapping: it is a marker, and a wrapped marker reads as damage.
 /// The number of enabled MCP servers sits next to the model, so the state is
 /// visible without a sentence printed above the wordmark.
-///
-/// Returns the raw-mode guard when the tagline animated. The reader holds it
-/// for the first prompt, so keys typed during the reveal are queued in raw
-/// mode rather than echoed onto the animation row and then flushed.
-pub fn banner(cfg: &Config, mcp_active: usize) -> Option<crate::term::RawGuard> {
+pub fn banner(cfg: &Config, mcp_active: usize) {
     let width = crate::term::cols().saturating_sub(1);
-    // Hold the row lock across the wordmark and the reveal. A background
-    // catalog refresh can warn at any moment, and a warning printed between two
-    // frames would splice into the animation row; holding the lock makes the
-    // header and tagline one block, with any warning after it.
-    let raw = {
+    // Hold the row lock while the wordmark prints. A background catalog
+    // refresh can warn at any moment, and a warning spliced into the row
+    // would read as damage; holding the lock keeps the header one block.
+    {
         let _row = crate::term::row_lock();
         println!("{}", header_line(cfg.provider.name(), &cfg.model, mcp_active, width));
-        tagline()
-    };
+    }
     if cfg.api_key.is_empty() && cfg.provider.requires_key() {
         warn(&format!("set {} or run /provider to switch", cfg.provider.key_env()));
     }
-    raw
 }
 
 /// The wordmark row, built without printing so its layout can be asserted.
@@ -439,128 +407,6 @@ fn header_line(provider: &str, model: &str, mcp_active: usize, width: usize) -> 
         line.push_str(&paint(GREEN, &mcp_active.to_string()));
     }
     line
-}
-
-/// The settled tagline. `text` is already clamped to the window.
-fn tagline_final(text: &str) -> String {
-    format!("{} {}", paint(GREEN, TAGLINE_MARK), text)
-}
-
-/// Print the tagline, animated on a real terminal and static everywhere else.
-/// Reduced motion (`--no-spinner`) and pipes get the final line immediately, so
-/// the flourish can never be the reason a script or an accessibility setup
-/// waits on rift.
-///
-/// The caller holds the row lock for the whole reveal, sleeps included, so a
-/// background warning cannot print between frames and splice into the row.
-///
-/// The animation runs in raw mode: echo is off, so a keystroke cannot land in
-/// the middle of the frame, and anything typed is left in the input queue for
-/// the first prompt. The guard goes back to the caller instead of being
-/// dropped, because dropping it would restore cooked mode and the reader would
-/// have to enter raw mode again, flushing exactly those keys.
-fn tagline() -> Option<crate::term::RawGuard> {
-    let width = crate::term::cols().saturating_sub(1);
-    let text = clamp(TAGLINE, width.saturating_sub(TAGLINE_MARK.len() + 1));
-    let animate = !cfg!(test)
-        && crate::term::is_tty()
-        && io::stdout().is_terminal()
-        && !QUIET.load(std::sync::atomic::Ordering::Relaxed);
-    if !animate {
-        println!("{}", tagline_final(&text));
-        return None;
-    }
-    // No raw mode means echo would paint over the animation. A still tagline
-    // is better than a line the user's first keystroke can corrupt.
-    let raw = crate::term::RawGuard::new();
-    if raw.is_none() {
-        println!("{}", tagline_final(&text));
-        return None;
-    }
-    // A different seed per launch means the same reveal never looks canned.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ (u64::from(std::process::id()) << 32);
-    let mut out = io::stdout().lock();
-    for step in 0..=TAGLINE_STEPS {
-        let line = format!(
-            "{} {}",
-            paint(GREEN, TAGLINE_MARK),
-            tagline_frame(&text, step, TAGLINE_STEPS, seed)
-        );
-        // The row is ours until the newline below: the banner holds the row
-        // lock across the whole reveal, so background writers wait rather than
-        // splicing a warning into a frame.
-        let _ = write!(out, "\r\x1b[K{line}");
-        let _ = out.flush();
-        if step < TAGLINE_STEPS {
-            std::thread::sleep(std::time::Duration::from_millis(TAGLINE_STEP_MS));
-        }
-    }
-    // One green beat when the whole phrase is in place, then the quiet settle.
-    let flash = format!("{} {}", paint(GREEN, TAGLINE_MARK), paint(GREEN, &text));
-    let _ = write!(out, "\r\x1b[K{flash}");
-    let _ = out.flush();
-    std::thread::sleep(std::time::Duration::from_millis(TAGLINE_FLASH_MS));
-    let _ = writeln!(out, "\r\x1b[K{}", tagline_final(&text));
-    let _ = out.flush();
-    raw
-}
-
-/// The reveal window for `n` characters at `step` of `steps`: the number of
-/// characters locked, as a half-open range growing from the middle out.
-fn reveal_range(n: usize, step: usize, steps: usize) -> (usize, usize) {
-    if n == 0 || steps == 0 || step == 0 {
-        return (0, 0);
-    }
-    let locked = n * step.min(steps) / steps;
-    let center = n / 2;
-    let lo = center.saturating_sub(locked / 2);
-    (lo, (lo + locked).min(n))
-}
-
-/// One frame: spaces stay put, unlocked cells are cipher noise, locked cells
-/// carry the real text, and the two edges of the rift are green. At the last
-/// step every cell is locked and the line is the plain tagline.
-fn tagline_frame(text: &str, step: usize, steps: usize, seed: u64) -> String {
-    let total = text.chars().filter(|c| !c.is_whitespace()).count();
-    let (lo, hi) = reveal_range(total, step, steps);
-    let mut out = String::new();
-    let mut rank = 0usize;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            out.push(ch);
-            continue;
-        }
-        if rank >= lo && rank < hi {
-            let edge = (rank == lo && lo > 0) || (rank + 1 == hi && hi < total);
-            if edge {
-                out.push_str(&paint(GREEN, &ch.to_string()));
-            } else {
-                out.push(ch);
-            }
-        } else {
-            out.push_str(&paint(DIM, &cipher(rank, step, seed).to_string()));
-        }
-        rank += 1;
-    }
-    out
-}
-
-/// A deterministic cipher glyph for a cell and frame. A small integer hash is
-/// enough: no rng crate, no shared state, and a test can pin the seed.
-fn cipher(slot: usize, frame: usize, seed: u64) -> char {
-    let mut x = seed
-        ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (frame as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^= x >> 31;
-    CIPHER[(x % CIPHER.len() as u64) as usize] as char
 }
 
 /// The model's answer, printed as plain text.
@@ -2254,20 +2100,11 @@ impl<'h> Input<'h> {
 
 pub struct Reader {
     hist: Vec<String>,
-    /// Raw mode already entered by the startup reveal. The first prompt adopts
-    /// it instead of entering raw mode again and flushing the keys typed while
-    /// the tagline was animating.
-    raw: Option<crate::term::RawGuard>,
 }
 
 impl Reader {
     pub fn new() -> Self {
-        Reader { hist: Vec::new(), raw: None }
-    }
-
-    /// Hand the reader a raw-mode guard to use for the first prompt.
-    pub fn hold_raw(&mut self, raw: Option<crate::term::RawGuard>) {
-        self.raw = raw;
+        Reader { hist: Vec::new() }
     }
 
     pub fn read_line(
@@ -2277,16 +2114,12 @@ impl Reader {
         providers: &[(String, String)],
         prefill: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        // Take the guard before the TTY check, so a guard acquired by the
-        // reveal is restored on every return path. The first prompt inherits
-        // it; later prompts enter raw mode themselves.
-        let raw = self.raw.take();
         if !crate::term::is_tty() {
             print!("{PROMPT} ");
             io::stdout().flush().ok();
             return Ok(read_raw().map(|s| s.trim_end_matches(['\n', '\r']).to_string()));
         }
-        let _raw = raw.or_else(crate::term::RawGuard::new);
+        let _raw = crate::term::RawGuard::new();
         let mut input = Input::new(&mut self.hist);
         // Context first: `set_text` recomputes the menu, and the menu needs
         // the catalog to have anything to show.
@@ -3140,27 +2973,6 @@ mod tests {
         let narrow = strip_sgr(&header_line("tokenharbor", "deepseek-v4.1-flash-1017", 3, 20));
         assert!(narrow.chars().count() <= 20, "{narrow:?}");
         assert!(!narrow.contains("mcp"), "{narrow:?}");
-    }
-
-    #[test]
-    fn the_tagline_opens_from_the_middle_and_settles_plain() {
-        assert_eq!(reveal_range(0, 3, 7), (0, 0));
-        assert_eq!(reveal_range(10, 0, 7), (0, 0));
-        assert_eq!(reveal_range(10, 7, 7), (0, 10));
-        let (lo, hi) = reveal_range(10, 3, 7);
-        assert_eq!((lo, hi), (3, 7));
-        // The last frame is the exact line; earlier frames keep its width and
-        // leave spaces where the words will sit.
-        assert_eq!(tagline_frame("your personal hacker", 7, 7, 1), "your personal hacker");
-        let early = tagline_frame("ab cd", 0, 7, 1);
-        assert_eq!(early.chars().count(), 5, "{early:?}");
-        assert_eq!(early.chars().nth(2), Some(' '), "{early:?}");
-        // The middle locks before the edges, so both ends are still cipher.
-        let middle = tagline_frame("abcdef", 4, 7, 1);
-        let chars: Vec<char> = middle.chars().collect();
-        assert_eq!(&chars[2..5], ['c', 'd', 'e']);
-        assert!(CIPHER.iter().all(|b| b.is_ascii_graphic()), "a glyph is not ASCII");
-        assert_eq!(tagline_final("x"), ">_ x");
     }
 
     #[test]
